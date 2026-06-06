@@ -41,7 +41,13 @@ wget -O /tmp/pve-tm.zip https://github.com/smmya/pve-traffic-manager/archive/ref
 
 ```bash
 cd pve-traffic-manager
-python3 manager.py
+python3 manager.py        # 首次运行
+```
+
+安装快捷指令后，在任意目录直接输入 `ptm` 即可启动：
+
+```bash
+ptm                       # 全局快捷启动
 ```
 
 CLI 菜单结构：
@@ -146,6 +152,7 @@ pve-traffic-manager/
 | 历史数据 | SQLite 存储流量日志（每次采集的增量）和操作日志 |
 | 流量重置 | 前台手动触发整组重置，数据不丢失 |
 | 升级支持 | 系统设置菜单调用 upgrade.py，一键检查并升级，自动备份数据 |
+| 快捷指令 | 一键注册 `ptm` 全局命令，任意目录直接启动 |
 
 ---
 
