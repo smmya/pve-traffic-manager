@@ -79,19 +79,11 @@ def format_bytes(size_bytes):
         return f"{size_bytes} B"
 
 
-def format_mb(mb):
-    """MB 转可读格式"""
+def format_gb(mb):
+    """MB 转 GB 可读格式（始终以 GB 显示）"""
     if mb is None:
         return "N/A"
-    if mb >= 1024:
-        return f"{mb / 1024:.2f} GB"
-    else:
-        return f"{mb:.2f} MB"
-
-
-def format_traffic_mb(mb):
-    """流量 MB 格式化"""
-    return format_mb(mb)
+    return f"{mb / 1024:.2f} GB"
 
 
 def input_choice(prompt, valid_choices):
@@ -203,7 +195,7 @@ def menu_group_management():
                 rows.append([
                     str(g['id']),
                     g['name'],
-                    format_mb(g['traffic_limit_mb']),
+                    format_gb(g['traffic_limit_mb']),
                     notify_info,
                     g['created_at']
                 ])
@@ -249,11 +241,12 @@ def _create_group():
         input("  按回车返回...")
         return
 
-    limit = input_number("  流量限额 (MB): ")
+    limit = input_number("  流量限额 (GB): ")
     if limit is None or limit <= 0:
         print("  限额必须为正数")
         input("  按回车返回...")
         return
+    limit = limit * 1024  # 转换为 MB 存储
 
     notify = input("  通知命令 (可选，直接回车跳过): ").strip()
 
@@ -278,7 +271,7 @@ def _modify_group():
         return
 
     for g in groups:
-        print(f"  [{g['id']}] {g['name']} (限额: {format_mb(g['traffic_limit_mb'])})")
+        print(f"  [{g['id']}] {g['name']} (限额: {format_gb(g['traffic_limit_mb'])})")
 
     gid = input_number("\n  请输入要修改的组ID: ")
     if gid is None:
@@ -296,8 +289,10 @@ def _modify_group():
     if not new_name:
         new_name = None
 
-    print(f"  当前限额: {format_mb(group['traffic_limit_mb'])}")
-    new_limit = input_number("  新限额 MB (直接回车保持不变): ", allow_empty=True)
+    print(f"  当前限额: {format_gb(group['traffic_limit_mb'])}")
+    new_limit = input_number("  新限额 GB (直接回车保持不变): ", allow_empty=True)
+    if new_limit is not None:
+        new_limit = new_limit * 1024  # 转换为 MB 存储
 
     print(f"  当前通知命令: {group.get('notify_cmd', '-')}")
     new_notify = input("  新通知命令 (直接回车保持不变): ").strip()
@@ -324,7 +319,7 @@ def _delete_group():
 
     for g in groups:
         vms = db.get_group_vms(g['id'])
-        print(f"  [{g['id']}] {g['name']} (限额: {format_mb(g['traffic_limit_mb'])}, VM数: {len(vms)})")
+        print(f"  [{g['id']}] {g['name']} (限额: {format_gb(g['traffic_limit_mb'])}, VM数: {len(vms)})")
 
     gid = input_number("\n  请输入要删除的组ID: ")
     if gid is None:
@@ -399,10 +394,10 @@ def _view_group_vms():
                 traffic_rows.append([
                     str(v['vm_id']),
                     type_label,
-                    format_mb(summary['total_in_mb']),
-                    format_mb(summary['total_out_mb']),
-                    format_mb(total),
-                    format_mb(group['traffic_limit_mb']),
+                    format_gb(summary['total_in_mb']),
+                    format_gb(summary['total_out_mb']),
+                    format_gb(total),
+                    format_gb(group['traffic_limit_mb']),
                     f"{pct:.1f}%"
                 ])
         if traffic_rows:
@@ -501,7 +496,7 @@ def _add_vms_to_group():
     print("  可用组:")
     for g in groups:
         vms = db.get_group_vms(g['id'])
-        print(f"  [{g['id']}] {g['name']} (限额: {format_mb(g['traffic_limit_mb'])}, 已有VM: {len(vms)})")
+        print(f"  [{g['id']}] {g['name']} (限额: {format_gb(g['traffic_limit_mb'])}, 已有VM: {len(vms)})")
 
     gid = input_number("\n  请选择目标组ID: ")
     if gid is None:
@@ -550,7 +545,7 @@ def _add_vms_to_group():
                                           initial_out_mb=initial_out_mb)
         if success:
             success_count += 1
-            print(f"  [成功] {vm_type.upper()} {vmid} 已加入组 '{group['name']}' (初始: {initial_in_mb:.1f} MB)")
+            print(f"  [成功] {vm_type.upper()} {vmid} 已加入组 '{group['name']}' (初始: {(initial_in_mb + initial_out_mb) / 1024:.1f} GB)")
         else:
             print(f"  [跳过] {vm_type.upper()} {vmid}: {msg}")
 
@@ -699,8 +694,8 @@ def _traffic_overview():
             str(g['group_id']),
             g['group_name'],
             str(g['vm_count']),
-            format_mb(g['total_traffic']),
-            format_mb(limit),
+            format_gb(g['total_traffic']),
+            format_gb(limit),
             f"{over_count}/{g['vm_count']}" if g['vm_count'] > 0 else '-'
         ])
     print_table(headers, rows)
@@ -734,7 +729,7 @@ def _traffic_group_detail():
         return
 
     vms = db.get_group_traffic_overview(gid)
-    print(f"\n  组: {group['name']} | 单VM限额: {format_mb(group['traffic_limit_mb'])}")
+    print(f"\n  组: {group['name']} | 单VM限额: {format_gb(group['traffic_limit_mb'])}")
     print(f"  通知命令: {group.get('notify_cmd', '(未设置)')}")
 
     if not vms:
@@ -752,9 +747,9 @@ def _traffic_group_detail():
         rows.append([
             str(v['vm_id']),
             v.get('vm_name', ''),
-            format_mb(v['total_in_mb']),
-            format_mb(v['total_out_mb']),
-            format_mb(total),
+            format_gb(v['total_in_mb']),
+            format_gb(v['total_out_mb']),
+            format_gb(total),
             f"{pct:.1f}%",
             status_icon
         ])
@@ -763,7 +758,7 @@ def _traffic_group_detail():
     # 汇总
     total_all = sum(v['total_in_mb'] + v['total_out_mb'] for v in vms)
     over_count = sum(1 for v in vms if (v['total_in_mb'] + v['total_out_mb']) >= group['traffic_limit_mb'])
-    print(f"\n  组总流量: {format_mb(total_all)} | 超限VM: {over_count}/{len(vms)}")
+    print(f"\n  组总流量: {format_gb(total_all)} | 超限VM: {over_count}/{len(vms)}")
 
     input("\n  按回车返回...")
 
@@ -814,8 +809,8 @@ def _traffic_vm_detail():
             total = summary['total_in_mb'] + summary['total_out_mb']
             pct = (total / vg['traffic_limit_mb'] * 100) if vg['traffic_limit_mb'] > 0 else 0
             print(f"  组 '{vg['group_name']}':")
-            print(f"    入站: {format_mb(summary['total_in_mb'])} | 出站: {format_mb(summary['total_out_mb'])}")
-            print(f"    合计: {format_mb(total)} | 限额: {format_mb(vg['traffic_limit_mb'])} | 使用率: {pct:.1f}%")
+            print(f"    入站: {format_gb(summary['total_in_mb'])} | 出站: {format_gb(summary['total_out_mb'])}")
+            print(f"    合计: {format_gb(total)} | 限额: {format_gb(vg['traffic_limit_mb'])} | 使用率: {pct:.1f}%")
             print(f"    上次重置: {summary['last_reset']}")
 
     # 最近日志
@@ -851,7 +846,7 @@ def _reset_traffic():
     for g in groups:
         vms = db.get_group_traffic_overview(g['id'])
         total = sum(v['total_in_mb'] + v['total_out_mb'] for v in vms)
-        print(f"  [{g['id']}] {g['name']} (当前总流量: {format_mb(total)})")
+        print(f"  [{g['id']}] {g['name']} (当前总流量: {format_gb(total)})")
 
     gid = input_number("\n  请选择要重置的组ID: ")
     if gid is None:
@@ -1183,7 +1178,7 @@ def _view_config():
     print(f"\n  各组流量限额:")
     for g in groups:
         vms = db.get_group_vms(g['id'])
-        print(f"    {g['name']}: {format_mb(g['traffic_limit_mb'])}/台 ({len(vms)} 台)")
+        print(f"    {g['name']}: {format_gb(g['traffic_limit_mb'])}/台 ({len(vms)} 台)")
 
     print(f"\n  通知配置:")
     for g in groups:
