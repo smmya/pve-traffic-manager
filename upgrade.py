@@ -20,7 +20,7 @@ from datetime import datetime
 # --- 配置 ---
 REPO_OWNER = "smmya"
 REPO_NAME = "pve-traffic-manager"
-RAW_URL = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main"
+RAW_URL = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/refs/heads/main"
 
 SOURCE_FILES = [
     "manager.py",
@@ -55,7 +55,7 @@ def get_local_version():
 
 
 def get_remote_version():
-    url = f"{RAW_URL}/VERSION"
+    url = f"{RAW_URL}/VERSION?_cb={int(datetime.now().timestamp())}"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "pve-traffic-manager-upgrader"})
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -109,7 +109,7 @@ def backup_data():
 
 
 def download_file(filename):
-    url = f"{RAW_URL}/{filename}"
+    url = f"{RAW_URL}/{filename}?_cb={int(datetime.now().timestamp())}"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "pve-traffic-manager-upgrader"})
         with urllib.request.urlopen(req, timeout=15) as resp:
