@@ -323,6 +323,37 @@ def reset_group_traffic(group_id):
     return True
 
 
+def reset_vm_traffic(vm_id, vm_type, group_id):
+    """重置单台虚拟机在指定组中的流量"""
+    conn = get_conn()
+    now = __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    conn.execute(
+        "INSERT INTO traffic_resets (group_id, vm_id, vm_type, reason) VALUES (?, ?, ?, 'auto_restart')",
+        (group_id, vm_id, vm_type)
+    )
+    conn.execute(
+        "UPDATE traffic_summary SET total_in_mb=0, total_out_mb=0, last_reset=? WHERE vm_id=? AND vm_type=? AND group_id=?",
+        (now, vm_id, vm_type, group_id)
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def get_last_shutdown_for_vm(vm_id):
+    """获取某台VM最近一次关机记录（用于判断是否为PTM超限关机）"""
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT * FROM action_logs
+           WHERE action='shutdown' AND target_type='vm' AND target_id=?
+           ORDER BY created_at DESC LIMIT 1""",
+        (vm_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def get_all_traffic_overview():
     """获取所有组的流量概览"""
     conn = get_conn()

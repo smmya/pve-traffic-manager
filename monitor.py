@@ -132,6 +132,39 @@ def check_and_shutdown(vm_id, vm_type, vm_name, group_id, group_name, limit_mb, 
         return ok, f"{'成功' if ok else '失败'}: {msg}"
 
 
+def check_auto_reset(vm_id, vm_type):
+    """
+    检查VM是否被PTM超限关机后重新启动，如果是则自动重置流量
+    返回: True 如果执行了重置
+    """
+    # 1. 查最近一次关机记录
+    shutdown_log = db.get_last_shutdown_for_vm(vm_id)
+    if not shutdown_log:
+        return False
+
+    detail = shutdown_log.get('detail', '')
+    if '超限关机' not in detail:
+        return False  # 不是PTM关的，不重置
+
+    # 2. 检查VM当前是否在运行（说明已被手动重启）
+    status = pve.get_vm_status(vm_id, vm_type)
+    if not status or status.get('status') != 'running':
+        return False  # 还没启动，不重置
+
+    # 3. 自动重置该VM在每个组中的流量
+    type_label = 'KVM' if vm_type == 'qemu' else 'LXC'
+    groups = db.get_vm_groups(vm_id, vm_type)
+    for g in groups:
+        db.reset_vm_traffic(vm_id, vm_type, g['group_id'])
+        log(f"  [自动重置] {type_label} {vm_id} 检测到PTM超限关机后重启，已重置流量 (组: {g['group_name']})")
+
+    # 记录操作日志
+    db.insert_action_log('reset', 'vm', vm_id,
+                         f"自动重置: {type_label} {vm_id} 超限关机后重启")
+
+    return True
+
+
 def run_monitor(dry_run=False, collect_only=False):
     """执行一次完整的监控循环"""
     if collect_only:
@@ -149,6 +182,10 @@ def run_monitor(dry_run=False, collect_only=False):
         return
 
     log(f"管理 {len(managed)} 台虚拟机")
+
+    # --- 自动重置检查 ---
+    for vm in managed:
+        check_auto_reset(vm['vm_id'], vm['vm_type'])
 
     # --- 采集流量 ---
     for vm in managed:
