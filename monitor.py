@@ -5,8 +5,9 @@ PVE 流量控制管理器 - 后台监控脚本
 由 crontab 定时调用，实现流量采集、超限判断、通知和关机
 
 用法:
-    python monitor.py            # 执行一次监控循环
-    python monitor.py --dry-run  # 演习模式，不实际关机
+    python monitor.py               # 执行一次监控循环 (采集 + 超限检查)
+    python monitor.py --dry-run     # 演习模式，不实际关机
+    python monitor.py --collect-only # 仅采集流量，跳过超限检查
 """
 
 import sys
@@ -131,9 +132,14 @@ def check_and_shutdown(vm_id, vm_type, vm_name, group_id, group_name, limit_mb, 
         return ok, f"{'成功' if ok else '失败'}: {msg}"
 
 
-def run_monitor(dry_run=False):
+def run_monitor(dry_run=False, collect_only=False):
     """执行一次完整的监控循环"""
-    mode = "演习模式" if dry_run else "监控模式"
+    if collect_only:
+        mode = "仅采集模式"
+    elif dry_run:
+        mode = "演习模式"
+    else:
+        mode = "监控模式"
     log(f"=== PVE 流量监控开始 ({mode}) ===")
 
     # 获取所有已管理的虚拟机
@@ -144,13 +150,13 @@ def run_monitor(dry_run=False):
 
     log(f"管理 {len(managed)} 台虚拟机")
 
+    # --- 采集流量 ---
     for vm in managed:
         vm_id = vm['vm_id']
         vm_type = vm['vm_type']
         vm_name = vm['vm_name']
         type_label = 'KVM' if vm_type == 'qemu' else 'LXC'
 
-        # --- 采集流量 ---
         delta_in, delta_out = collect_traffic(vm_id, vm_type)
         log(f"  {type_label} {vm_id} '{vm_name}': +{delta_in / 1024:.1f} KB in / +{delta_out / 1024:.1f} KB out")
 
@@ -160,22 +166,25 @@ def run_monitor(dry_run=False):
             if delta_in > 0 or delta_out > 0:
                 db.update_traffic_summary(vm_id, vm_type, vg['group_id'], delta_in, delta_out)
 
-    # --- 超限检查 ---
-    log("--- 超限检查 ---")
-    for vm in managed:
-        vm_id = vm['vm_id']
-        vm_type = vm['vm_type']
-        vm_name = vm['vm_name']
+    # --- 超限检查 (仅采集模式跳过) ---
+    if collect_only:
+        log("仅采集模式，跳过超限检查")
+    else:
+        log("--- 超限检查 ---")
+        for vm in managed:
+            vm_id = vm['vm_id']
+            vm_type = vm['vm_type']
+            vm_name = vm['vm_name']
 
-        vm_groups = db.get_vm_groups(vm_id, vm_type)
-        for vg in vm_groups:
-            action, detail = check_and_shutdown(
-                vm_id, vm_type, vm_name,
-                vg['group_id'], vg['group_name'], vg['traffic_limit_mb'],
-                dry_run
-            )
-            if action:
-                log(f"  [超限] 组 '{vg['group_name']}' :: {detail}")
+            vm_groups = db.get_vm_groups(vm_id, vm_type)
+            for vg in vm_groups:
+                action, detail = check_and_shutdown(
+                    vm_id, vm_type, vm_name,
+                    vg['group_id'], vg['group_name'], vg['traffic_limit_mb'],
+                    dry_run
+                )
+                if action:
+                    log(f"  [超限] 组 '{vg['group_name']}' :: {detail}")
 
     log("=== PVE 流量监控结束 ===")
 
@@ -184,9 +193,10 @@ if __name__ == '__main__':
     db.init_db()
 
     dry_run = '--dry-run' in sys.argv
+    collect_only = '--collect-only' in sys.argv
 
     try:
-        run_monitor(dry_run)
+        run_monitor(dry_run, collect_only)
     except Exception as e:
         log(f"监控异常: {e}")
         import traceback

@@ -535,10 +535,22 @@ def _add_vms_to_group():
 
     success_count = 0
     for vmid, vm_type in vms:
-        success, msg = db.add_vm_to_group(gid, vmid, vm_type)
+        # 获取该VM当前PVE流量计数器，作为初始流量
+        initial_in_mb = 0
+        initial_out_mb = 0
+        netin, netout, vm_status = pve.get_vm_network_traffic(vmid, vm_type)
+        if netin is not None and netout is not None:
+            initial_in_mb = netin / (1024 * 1024)
+            initial_out_mb = netout / (1024 * 1024)
+            # 记录基线日志，后续采集从这里计算增量
+            db.insert_traffic_log(vmid, vm_type, netin, netout, 0, 0)
+
+        success, msg = db.add_vm_to_group(gid, vmid, vm_type,
+                                          initial_in_mb=initial_in_mb,
+                                          initial_out_mb=initial_out_mb)
         if success:
             success_count += 1
-            print(f"  [成功] {vm_type.upper()} {vmid} 已加入组 '{group['name']}'")
+            print(f"  [成功] {vm_type.upper()} {vmid} 已加入组 '{group['name']}' (初始: {initial_in_mb:.1f} MB)")
         else:
             print(f"  [跳过] {vm_type.upper()} {vmid}: {msg}")
 
@@ -905,6 +917,36 @@ def _traffic_history():
 #  系统设置菜单
 # ============================================================
 
+def _upgrade_call():
+    """调用 upgrade.py 进行升级"""
+    clear_screen()
+    print_header("检查并升级程序")
+
+    upgrade_script = os.path.join(BASE_DIR, "upgrade.py")
+    if not os.path.exists(upgrade_script):
+        print("\n  未找到 upgrade.py，请确保文件完整\n")
+        input("  按回车返回...")
+        return
+
+    print(f"  正在启动升级程序...")
+    print(f"  命令: {PYTHON_PATH} {upgrade_script}")
+    print()
+
+    try:
+        proc = subprocess.run(
+            [PYTHON_PATH, upgrade_script],
+            cwd=BASE_DIR
+        )
+        if proc.returncode == 0:
+            print(f"\n  [完成] 升级程序执行完毕")
+        else:
+            print(f"\n  [退出] 升级程序返回码: {proc.returncode}")
+    except Exception as e:
+        print(f"\n  [错误] {e}")
+
+    input("\n  按回车返回...")
+
+
 def menu_settings():
     """系统设置子菜单"""
     while True:
@@ -918,9 +960,10 @@ def menu_settings():
         print(f"  1. 查看当前配置")
         print(f"  2. 后台监控管理 {status_text}")
         print(f"  3. 查看操作日志")
+        print(f"  4. 检查并升级程序")
         print(f"  0. 返回主菜单")
 
-        choice = input_choice("  请选择 [0-3]: ", ['0', '1', '2', '3'])
+        choice = input_choice("  请选择 [0-4]: ", ['0', '1', '2', '3', '4'])
 
         if choice == '0':
             break
@@ -930,6 +973,8 @@ def menu_settings():
             _crontab_manage()
         elif choice == '3':
             _view_action_logs()
+        elif choice == '4':
+            _upgrade_call()
 
 
 def _run(cmd_list, timeout=10):

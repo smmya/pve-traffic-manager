@@ -174,18 +174,18 @@ def delete_group(group_id):
 #  组内虚拟机 (group_vms) 相关操作
 # ============================================================
 
-def add_vm_to_group(group_id, vm_id, vm_type, vm_name=''):
-    """将虚拟机加入组"""
+def add_vm_to_group(group_id, vm_id, vm_type, vm_name='', initial_in_mb=0, initial_out_mb=0):
+    """将虚拟机加入组，可指定初始流量值"""
     conn = get_conn()
     try:
         conn.execute(
             "INSERT INTO group_vms (group_id, vm_id, vm_type, vm_name) VALUES (?, ?, ?, ?)",
             (group_id, vm_id, vm_type, vm_name)
         )
-        # 同时创建 traffic_summary 记录
+        # 同时创建 traffic_summary 记录，使用传入的初始流量值
         conn.execute(
-            "INSERT OR IGNORE INTO traffic_summary (vm_id, vm_type, group_id) VALUES (?, ?, ?)",
-            (vm_id, vm_type, group_id)
+            "INSERT OR IGNORE INTO traffic_summary (vm_id, vm_type, group_id, total_in_mb, total_out_mb) VALUES (?, ?, ?, ?, ?)",
+            (vm_id, vm_type, group_id, initial_in_mb, initial_out_mb)
         )
         conn.commit()
         return True, "加入成功"

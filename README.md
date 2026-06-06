@@ -87,11 +87,14 @@ print('已安装')
 
 ### 3. 升级
 
+在 `manager.py` 中进入 **系统设置 → 检查并升级程序**，会自动调用 `upgrade.py` 完成升级。
+
+也可以独立运行：
+
 ```bash
-cd pve-traffic-manager
-python3 upgrade.py              # 检查并升级到最新版
-python3 upgrade.py --check      # 仅检查是否有新版本
-python3 upgrade.py --force      # 强制升级（跳过版本比较）
+python3 upgrade.py              # 检查并升级
+python3 upgrade.py --check      # 仅检查新版本
+python3 upgrade.py --force      # 强制升级
 ```
 
 ---
@@ -142,7 +145,7 @@ pve-traffic-manager/
 | 通知接口 | `notify_cmd` 字段可配自定义脚本，支持变量替换 |
 | 历史数据 | SQLite 存储流量日志（每次采集的增量）和操作日志 |
 | 流量重置 | 前台手动触发整组重置，数据不丢失 |
-| 升级支持 | `upgrade.py` 从 GitHub 拉取最新版，自动备份数据 |
+| 升级支持 | 系统设置菜单调用 upgrade.py，一键检查并升级，自动备份数据 |
 
 ---
 
