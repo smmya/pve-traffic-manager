@@ -30,7 +30,7 @@ python3 manager.py
 或者一行命令完成下载、解压、启动：
 
 ```bash
-wget -qO- https://github.com/smmya/pve-traffic-manager/archive/refs/heads/main.zip | bsdtar -xvf- && mv pve-traffic-manager-main pve-traffic-manager && cd pve-traffic-manager && python3 manager.py
+wget -qO- https://github.com/smmya/pve-traffic-manager/archive/refs/heads/main.zip | tar -xvf- && mv pve-traffic-manager-main pve-traffic-manager && cd pve-traffic-manager && python3 manager.py
 ```
 
 ---
