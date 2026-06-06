@@ -53,19 +53,37 @@ CLI 菜单结构：
 1. 组管理        → 创建/修改/删除管理组，设定流量限额
 2. 虚拟机管理    → 扫描 VM，批量加入组（支持 100-110 范围写法）
 3. 流量监控      → 查看流量概览/详情/历史，手动重置
-4. 系统设置      → 查看配置、crontab 建议、操作日志
+4. 系统设置      → 查看配置、安装/卸载 crontab、操作日志
 5. 退出
 ```
 
-### 2. 后台监控（crontab）
+### 2. 后台监控（一键安装）
+
+在 `manager.py` 中进入 **系统设置 → 后台监控管理**，选择「安装后台监控」即可自动配置 crontab。
 
 ```bash
-# 编辑 crontab
-crontab -e
+=== 系统设置 ===
+  1. 查看当前配置
+  2. 后台监控管理 [已安装]  ← 这里自动显示安装状态
+  3. 查看操作日志
 
-# 添加以下行（每 5 分钟执行一次）
-*/5 * * * * /usr/bin/python3 /root/pve-traffic-manager/monitor.py
+=== 后台监控管理 ===
+  1. 安装后台监控          ← 自动写入 crontab，可选择间隔
+  2. 卸载后台监控          ← 一键移除
+  3. 手动执行一次监控      ← 前台测试运行
 ```
+
+也可以直接用命令行：
+
+```bash
+# 手动安装 crontab（5分钟间隔，默认）
+python3 -c "
+import subprocess, sys, os
+d = os.path.dirname(os.path.abspath('monitor.py'))
+line = f'*/5 * * * * {sys.executable} {d}/monitor.py # pve-traffic-manager monitor'
+subprocess.run(['crontab', '-'], input=f'{line}\n', text=True)
+print('已安装')
+"
 
 ### 3. 升级
 

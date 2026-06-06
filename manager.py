@@ -7,9 +7,12 @@ PVE 流量控制管理器 - CLI 前台交互主程序
 import os
 import sys
 import re
+import subprocess
 import db
 import pve
-from config import BASE_DIR, PYTHON_PATH, MONITOR_SCRIPT
+from config import BASE_DIR, PYTHON_PATH, MONITOR_SCRIPT, DEFAULT_MONITOR_INTERVAL
+
+CRONTAB_MARKER = "# pve-traffic-manager monitor"
 
 
 # ============================================================
@@ -908,10 +911,14 @@ def menu_settings():
         clear_screen()
         print_header("系统设置")
 
-        print("  1. 查看当前配置")
-        print("  2. crontab 配置建议")
-        print("  3. 查看操作日志")
-        print("  0. 返回主菜单")
+        # 显示 crontab 状态
+        installed, current = _crontab_status()
+        status_text = "[已安装]" if installed else "[未安装]"
+
+        print(f"  1. 查看当前配置")
+        print(f"  2. 后台监控管理 {status_text}")
+        print(f"  3. 查看操作日志")
+        print(f"  0. 返回主菜单")
 
         choice = input_choice("  请选择 [0-3]: ", ['0', '1', '2', '3'])
 
@@ -920,9 +927,195 @@ def menu_settings():
         elif choice == '1':
             _view_config()
         elif choice == '2':
-            _crontab_guide()
+            _crontab_manage()
         elif choice == '3':
             _view_action_logs()
+
+
+def _run(cmd_list, timeout=10):
+    """执行命令，返回 (ok, stdout)"""
+    try:
+        r = subprocess.run(cmd_list, capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, r.stdout.strip()
+    except Exception:
+        return False, ""
+
+
+def _crontab_status():
+    """检查 crontab 是否已安装"""
+    ok, stdout = _run(['crontab', '-l'])
+    if not ok:
+        return False, ""
+    for line in stdout.splitlines():
+        if CRONTAB_MARKER in line:
+            return True, line.strip()
+    return False, ""
+
+
+def _crontab_manage():
+    """后台监控管理子菜单"""
+    while True:
+        clear_screen()
+        print_header("后台监控管理")
+
+        installed, entry = _crontab_status()
+
+        if installed:
+            print(f"  状态: [已安装]")
+            print(f"  当前任务: {entry}")
+        else:
+            print(f"  状态: [未安装]")
+            print(f"  建议任务: */{DEFAULT_MONITOR_INTERVAL} * * * * {PYTHON_PATH} {MONITOR_SCRIPT}")
+
+        print()
+        if installed:
+            print("  1. 重新安装 (更新间隔)")
+            print("  2. 卸载后台监控")
+            print("  3. 手动执行一次监控 (前台)")
+        else:
+            print("  1. 安装后台监控")
+            print("  2. 手动执行一次监控 (前台)")
+
+        print("  0. 返回")
+
+        choices = ['0', '1', '2', '3'] if installed else ['0', '1', '2']
+        choice = input_choice("  请选择: ", choices)
+
+        if choice == '0':
+            break
+        elif choice == '1':
+            if installed:
+                _crontab_install()
+            else:
+                _crontab_install()
+        elif choice == '2' and installed:
+            _crontab_uninstall()
+        elif choice == '2' and not installed or choice == '3' and installed:
+            _crontab_run_once()
+
+
+def _crontab_install():
+    """安装/更新 crontab 任务"""
+    clear_screen()
+    print_header("安装后台监控")
+
+    # 选择间隔
+    interval = input_number(f"  监控间隔(分钟) [默认{DEFAULT_MONITOR_INTERVAL}]: ", allow_empty=True)
+    if interval is None:
+        interval = DEFAULT_MONITOR_INTERVAL
+    interval = int(interval)
+    if interval < 1:
+        interval = 1
+
+    cron_line = f"*/{interval} * * * * {PYTHON_PATH} {MONITOR_SCRIPT} {CRONTAB_MARKER}"
+
+    # 读取现有 crontab
+    ok, stdout = _run(['crontab', '-l'])
+    existing_lines = stdout.splitlines() if ok and stdout else []
+
+    # 移除旧条目
+    new_lines = [l for l in existing_lines if CRONTAB_MARKER not in l]
+
+    # 添加新条目
+    new_lines.append("")
+    new_lines.append(f"{CRONTAB_MARKER}")
+    new_lines.append(cron_line)
+    new_lines.append("")
+
+    # 写回 crontab
+    crontab_content = "\n".join(new_lines) + "\n"
+    try:
+        proc = subprocess.run(['crontab', '-'], input=crontab_content,
+                            capture_output=True, text=True, timeout=10)
+        if proc.returncode == 0:
+            print(f"\n  [成功] 后台监控已安装 (每 {interval} 分钟)")
+            print(f"  任务: {cron_line}")
+            db.insert_action_log('config_change', target_type='system',
+                               detail=f"安装 crontab 监控 (间隔 {interval} 分钟)")
+        else:
+            print(f"\n  [失败] {proc.stderr.strip()}")
+    except Exception as e:
+        print(f"\n  [失败] {e}")
+
+    input("\n  按回车返回...")
+
+
+def _crontab_uninstall():
+    """卸载 crontab 任务"""
+    clear_screen()
+    print_header("卸载后台监控")
+
+    if not confirm_action("  确认卸载后台监控任务?"):
+        print("  已取消")
+        input("  按回车返回...")
+        return
+
+    ok, stdout = _run(['crontab', '-l'])
+    existing_lines = stdout.splitlines() if ok and stdout else []
+
+    new_lines = [l for l in existing_lines if CRONTAB_MARKER not in l]
+
+    # 清理多余空行
+    while new_lines and new_lines[0] == "":
+        new_lines.pop(0)
+    while new_lines and new_lines[-1] == "":
+        new_lines.pop()
+
+    crontab_content = "\n".join(new_lines) + "\n" if new_lines else ""
+
+    try:
+        if crontab_content.strip():
+            proc = subprocess.run(['crontab', '-'], input=crontab_content,
+                                capture_output=True, text=True, timeout=10)
+        else:
+            # 空 crontab: 移除所有内容
+            proc = subprocess.run(['crontab', '-r'],
+                                capture_output=True, text=True, timeout=10)
+
+        if proc.returncode == 0:
+            print("\n  [成功] 后台监控已卸载")
+            db.insert_action_log('config_change', target_type='system',
+                               detail="卸载 crontab 监控")
+        else:
+            print(f"\n  [失败] {proc.stderr.strip()}")
+    except Exception as e:
+        print(f"\n  [失败] {e}")
+
+    input("\n  按回车返回...")
+
+
+def _crontab_run_once():
+    """手动执行一次监控"""
+    clear_screen()
+    print_header("手动执行监控")
+
+    print("  正在执行一次流量监控...")
+    print(f"  命令: {PYTHON_PATH} {MONITOR_SCRIPT}")
+    print()
+
+    try:
+        proc = subprocess.run(
+            [PYTHON_PATH, MONITOR_SCRIPT],
+            capture_output=True, text=True, timeout=120
+        )
+        output = proc.stdout.strip()
+        errors = proc.stderr.strip()
+
+        if output:
+            print(output)
+        if errors:
+            print(f"  [stderr]\n{errors}")
+
+        if proc.returncode == 0:
+            print(f"\n  [完成] 监控执行完毕")
+        else:
+            print(f"\n  [警告] 执行返回码: {proc.returncode}")
+    except subprocess.TimeoutExpired:
+        print("  [超时] 监控执行超时")
+    except Exception as e:
+        print(f"  [错误] {e}")
+
+    input("\n  按回车返回...")
 
 
 def _view_config():
@@ -932,11 +1125,13 @@ def _view_config():
 
     groups = db.get_all_groups()
     managed = db.get_all_managed_vms()
+    installed, entry = _crontab_status()
 
     print(f"  PVE 节点: {__import__('config').PVE_NODE}")
     print(f"  数据库路径: {__import__('config').DB_PATH}")
     print(f"  Python 路径: {PYTHON_PATH}")
     print(f"  监控脚本路径: {MONITOR_SCRIPT}")
+    print(f"  后台监控: {'[已安装] ' + entry if installed else '[未安装]'}")
     print(f"  管理组数量: {len(groups)}")
     print(f"  管理虚拟机: {len(managed)}")
 
@@ -949,30 +1144,6 @@ def _view_config():
     for g in groups:
         cmd = g.get('notify_cmd', '')
         print(f"    {g['name']}: {'[已配置] ' + cmd if cmd else '[未配置]'}")
-
-    input("\n  按回车返回...")
-
-
-def _crontab_guide():
-    """crontab 配置指南"""
-    clear_screen()
-    print_header("Crontab 配置")
-
-    print("  将以下行添加到 crontab 实现后台定时监控:")
-    print()
-    print(f"  # 每5分钟执行一次流量监控")
-    print(f"  */5 * * * * {PYTHON_PATH} {MONITOR_SCRIPT}")
-    print()
-    print("  操作步骤:")
-    print("  1. 在 PVE 终端执行: crontab -e")
-    print("  2. 粘贴上面的配置行")
-    print("  3. 保存退出")
-    print()
-    print("  验证:")
-    print("  crontab -l  # 查看当前定时任务")
-    print()
-    print("  手动测试监控脚本:")
-    print(f"  {PYTHON_PATH} {MONITOR_SCRIPT}")
 
     input("\n  按回车返回...")
 
