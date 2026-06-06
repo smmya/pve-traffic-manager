@@ -948,17 +948,19 @@ def menu_settings():
         clear_screen()
         print_header("系统设置")
 
-        # 显示 crontab 状态
+        # 显示 crontab 状态和快捷指令状态
         installed, current = _crontab_status()
-        status_text = "[已安装]" if installed else "[未安装]"
+        crontab_status = "[已安装]" if installed else "[未安装]"
+        shortcut_status = "[已安装]" if _shortcut_status() else "[未安装]"
 
         print(f"  1. 查看当前配置")
-        print(f"  2. 后台监控管理 {status_text}")
+        print(f"  2. 后台监控管理 {crontab_status}")
         print(f"  3. 查看操作日志")
         print(f"  4. 检查并升级程序")
+        print(f"  5. 快捷指令管理 {shortcut_status}")
         print(f"  0. 返回主菜单")
 
-        choice = input_choice("  请选择 [0-4]: ", ['0', '1', '2', '3', '4'])
+        choice = input_choice("  请选择 [0-5]: ", ['0', '1', '2', '3', '4', '5'])
 
         if choice == '0':
             break
@@ -970,6 +972,8 @@ def menu_settings():
             _view_action_logs()
         elif choice == '4':
             _upgrade_call()
+        elif choice == '5':
+            _shortcut_manage()
 
 
 def _run(cmd_list, timeout=10):
@@ -1154,6 +1158,105 @@ def _crontab_run_once():
         print("  [超时] 监控执行超时")
     except Exception as e:
         print(f"  [错误] {e}")
+
+    input("\n  按回车返回...")
+
+
+SHORTCUT_CMD = "ptm"
+SHORTCUT_PATH = f"/usr/local/bin/{SHORTCUT_CMD}"
+
+
+def _shortcut_manage():
+    """快捷指令管理子菜单"""
+    while True:
+        clear_screen()
+        print_header("快捷指令管理")
+
+        if _shortcut_status():
+            print(f"  状态: [已安装] 在任意目录输入 ptm 即可启动")
+            print()
+            print("  1. 重新安装快捷指令")
+            print("  2. 卸载快捷指令")
+            print("  0. 返回")
+            choice = input_choice("  请选择: ", ['0', '1', '2'])
+        else:
+            print(f"  状态: [未安装]")
+            print()
+            print("  1. 安装快捷指令 (ptm)")
+            print("  0. 返回")
+            choice = input_choice("  请选择: ", ['0', '1'])
+
+        if choice == '0':
+            break
+        elif choice == '1':
+            _shortcut_install()
+        elif choice == '2':
+            _shortcut_uninstall()
+
+
+def _shortcut_status():
+    """检查快捷指令是否已安装"""
+    return os.path.exists(SHORTCUT_PATH)
+
+
+def _shortcut_install():
+    """安装快捷指令 ptm"""
+    clear_screen()
+    print_header("安装快捷指令")
+
+    if _shortcut_status():
+        print(f"  快捷指令 '{SHORTCUT_CMD}' 已安装")
+        if confirm_action("  确认覆盖重新安装?"):
+            pass
+        else:
+            print("  已取消")
+            input("  按回车返回...")
+            return
+
+    script_content = f"""#!/bin/bash
+# pve-traffic-manager shortcut
+cd "{BASE_DIR}" && exec "{PYTHON_PATH}" "{os.path.join(BASE_DIR, 'manager.py')}" "$@"
+"""
+
+    try:
+        with open(SHORTCUT_PATH, "w") as f:
+            f.write(script_content)
+        os.chmod(SHORTCUT_PATH, 0o755)
+
+        print(f"\n  [成功] 快捷指令 '{SHORTCUT_CMD}' 已安装")
+        print(f"  现在可以在任意目录直接输入 ptm 启动程序")
+        db.insert_action_log('config_change', target_type='system',
+                           detail=f"安装快捷指令 {SHORTCUT_CMD}")
+    except PermissionError:
+        print(f"\n  [失败] 权限不足，请使用 root 运行")
+    except Exception as e:
+        print(f"\n  [失败] {e}")
+
+    input("\n  按回车返回...")
+
+
+def _shortcut_uninstall():
+    """卸载快捷指令 ptm"""
+    clear_screen()
+    print_header("卸载快捷指令")
+
+    if not _shortcut_status():
+        print(f"  快捷指令 '{SHORTCUT_CMD}' 未安装")
+        input("  按回车返回...")
+        return
+
+    if not confirm_action(f"  确认卸载快捷指令 '{SHORTCUT_CMD}'?"):
+        print("  已取消")
+        input("  按回车返回...")
+        return
+
+    try:
+        os.remove(SHORTCUT_PATH)
+        print(f"\n  [成功] 快捷指令 '{SHORTCUT_CMD}' 已卸载")
+        db.insert_action_log('config_change', target_type='system',
+                           detail=f"卸载快捷指令 {SHORTCUT_CMD}")
+    except Exception as e:
+        print(f"\n  [失败] {e}")
 
     input("\n  按回车返回...")
 
