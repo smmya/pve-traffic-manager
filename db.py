@@ -354,6 +354,19 @@ def get_last_shutdown_for_vm(vm_id):
     return dict(row) if row else None
 
 
+def get_last_auto_reset_for_vm(vm_id):
+    """获取某台VM最近一次自动重置记录（用于防止重复重置）"""
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT * FROM traffic_resets
+           WHERE vm_id=? AND reason='auto_restart'
+           ORDER BY reset_at DESC LIMIT 1""",
+        (vm_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def get_all_traffic_overview():
     """获取所有组的流量概览"""
     conn = get_conn()

@@ -115,11 +115,7 @@ def check_and_shutdown(vm_id, vm_type, vm_name, group_id, group_name, limit_mb, 
         if not notify_ok:
             log(f"  [通知失败] {type_label} {vm_id}: {notify_result}")
 
-    # 2. 记录操作日志
-    detail = f"{type_label} {vm_id} '{vm_name}' 超限关机: {total_mb:.2f}/{limit_mb:.2f} MB (组: {group_name})"
-    db.insert_action_log('shutdown', 'vm', vm_id, detail)
-
-    # 3. 关机
+    # 2. 关机
     if dry_run:
         log(f"  [演习] 将关闭 {type_label} {vm_id} '{vm_name}' (流量: {total_mb:.2f}/{limit_mb:.2f} MB)")
         return True, f"演习模式 - 将关闭 {type_label} {vm_id} '{vm_name}'"
@@ -127,6 +123,9 @@ def check_and_shutdown(vm_id, vm_type, vm_name, group_id, group_name, limit_mb, 
         ok, msg = pve.shutdown_vm(vm_id, vm_type)
         if ok:
             log(f"  [已关机] {type_label} {vm_id} '{vm_name}' (流量: {total_mb:.2f}/{limit_mb:.2f} MB)")
+            # 仅在成功关机后记录日志
+            detail = f"{type_label} {vm_id} '{vm_name}' 超限关机: {total_mb:.2f}/{limit_mb:.2f} MB (组: {group_name})"
+            db.insert_action_log('shutdown', 'vm', vm_id, detail)
         else:
             log(f"  [关机失败] {type_label} {vm_id} '{vm_name}': {msg}")
         return ok, f"{'成功' if ok else '失败'}: {msg}"
@@ -146,12 +145,17 @@ def check_auto_reset(vm_id, vm_type):
     if '超限关机' not in detail:
         return False  # 不是PTM关的，不重置
 
-    # 2. 检查VM当前是否在运行（说明已被手动重启）
+    # 2. 检查是否已经处理过这次关机事件（防止重复重置）
+    last_reset = db.get_last_auto_reset_for_vm(vm_id)
+    if last_reset and last_reset.get('reset_at', '') >= shutdown_log.get('created_at', ''):
+        return False  # 已经重置过了，跳过
+
+    # 3. 检查VM当前是否在运行（说明已被手动重启）
     status = pve.get_vm_status(vm_id, vm_type)
     if not status or status.get('status') != 'running':
         return False  # 还没启动，不重置
 
-    # 3. 自动重置该VM在每个组中的流量
+    # 4. 自动重置该VM在每个组中的流量
     type_label = 'KVM' if vm_type == 'qemu' else 'LXC'
     groups = db.get_vm_groups(vm_id, vm_type)
     for g in groups:
