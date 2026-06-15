@@ -59,12 +59,13 @@ def execute_notify(notify_cmd, vm_id, vm_name, group_name, usage_mb, limit_mb, v
 def collect_traffic(vm_id, vm_type):
     """
     采集单台虚拟机的流量
-    返回: (delta_in_bytes, delta_out_bytes) 或 (0, 0) 首次采集
+    返回: (delta_in_bytes, delta_out_bytes) 首次/正常采集
+           None 表示 VM 不在运行状态，跳过
     """
     netin, netout, status = pve.get_vm_network_traffic(vm_id, vm_type)
 
     if status != 'running':
-        return 0, 0
+        return None
 
     last_log = db.get_last_traffic_log(vm_id, vm_type)
 
@@ -104,6 +105,11 @@ def check_and_shutdown(vm_id, vm_type, vm_name, group_id, group_name, limit_mb, 
 
     # === 超限处理 ===
     type_label = 'KVM' if vm_type == 'qemu' else 'LXC'
+
+    # 0. 检查VM是否在运行（已关机的跳过）
+    vm_status = pve.get_vm_status(vm_id, vm_type)
+    if not vm_status or vm_status.get('status') != 'running':
+        return False, "VM不在运行状态，无需关机"
 
     # 1. 执行通知
     group = db.get_group_by_id(group_id)
@@ -198,7 +204,11 @@ def run_monitor(dry_run=False, collect_only=False):
         vm_name = vm['vm_name']
         type_label = 'KVM' if vm_type == 'qemu' else 'LXC'
 
-        delta_in, delta_out = collect_traffic(vm_id, vm_type)
+        result = collect_traffic(vm_id, vm_type)
+        if result is None:
+            continue  # 不在运行，跳过
+        delta_in, delta_out = result
+
         log(f"  {type_label} {vm_id} '{vm_name}': +{delta_in / 1024:.1f} KB in / +{delta_out / 1024:.1f} KB out")
 
         # --- 更新各组流量汇总 ---
