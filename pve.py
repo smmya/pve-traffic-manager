@@ -4,25 +4,24 @@ PVE 流量控制管理器 - PVE API 交互封装
 通过 pvesh / qm / pct 命令与 Proxmox VE 交互
 """
 
+import os
 import subprocess
 import json
 from config import PVE_NODE
 
 
-# PVE 命令绝对路径（cron 环境下 PATH 不含 /usr/sbin）
-PVESH = '/usr/sbin/pvesh'
-QM = '/usr/sbin/qm'
-PCT = '/usr/sbin/pct'
-
-
 def _run_cmd(cmd_list, timeout=15):
     """执行命令并返回 (success, stdout, stderr)"""
+    # 确保 /usr/sbin 在 PATH 中（cron 环境下缺失）
+    env = os.environ.copy()
+    env['PATH'] = '/usr/sbin:/usr/bin:/bin' + (':' + env.get('PATH', '') if env.get('PATH') else '')
     try:
         result = subprocess.run(
             cmd_list,
             capture_output=True,
             text=True,
-            timeout=timeout
+            timeout=timeout,
+            env=env
         )
         return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
     except subprocess.TimeoutExpired:
@@ -36,7 +35,7 @@ def _run_cmd(cmd_list, timeout=15):
 def get_all_qemu_vms():
     """获取所有 KVM 虚拟机列表"""
     ok, stdout, stderr = _run_cmd([
-        PVESH, 'get', f'/nodes/{PVE_NODE}/qemu', '--output-format', 'json'
+        'pvesh', 'get', f'/nodes/{PVE_NODE}/qemu', '--output-format', 'json'
     ])
     if not ok:
         return []
@@ -58,7 +57,7 @@ def get_all_qemu_vms():
 def get_all_lxc_vms():
     """获取所有 LXC 容器列表"""
     ok, stdout, stderr = _run_cmd([
-        PVESH, 'get', f'/nodes/{PVE_NODE}/lxc', '--output-format', 'json'
+        'pvesh', 'get', f'/nodes/{PVE_NODE}/lxc', '--output-format', 'json'
     ])
     if not ok:
         return []
@@ -87,7 +86,7 @@ def get_all_vms():
 def get_qemu_status(vmid):
     """获取 KVM 虚拟机当前状态（含 netin/netout）"""
     ok, stdout, stderr = _run_cmd([
-        PVESH, 'get', f'/nodes/{PVE_NODE}/qemu/{vmid}/status/current',
+        'pvesh', 'get', f'/nodes/{PVE_NODE}/qemu/{vmid}/status/current',
         '--output-format', 'json'
     ])
     if not ok:
@@ -101,7 +100,7 @@ def get_qemu_status(vmid):
 def get_lxc_status(vmid):
     """获取 LXC 容器当前状态（含 netin/netout）"""
     ok, stdout, stderr = _run_cmd([
-        PVESH, 'get', f'/nodes/{PVE_NODE}/lxc/{vmid}/status/current',
+        'pvesh', 'get', f'/nodes/{PVE_NODE}/lxc/{vmid}/status/current',
         '--output-format', 'json'
     ])
     if not ok:
@@ -142,13 +141,13 @@ def get_vm_network_traffic(vmid, vm_type):
 
 def shutdown_qemu(vmid):
     """关闭 KVM 虚拟机"""
-    ok, stdout, stderr = _run_cmd([        QM, 'shutdown', str(vmid)], timeout=30)
+    ok, stdout, stderr = _run_cmd([        'qm', 'shutdown', str(vmid)], timeout=30)
     return ok, stdout if ok else stderr
 
 
 def shutdown_lxc(vmid):
     """关闭 LXC 容器"""
-    ok, stdout, stderr = _run_cmd([        PCT, 'shutdown', str(vmid)], timeout=30)
+    ok, stdout, stderr = _run_cmd([        'pct', 'shutdown', str(vmid)], timeout=30)
     return ok, stdout if ok else stderr
 
 
