@@ -11,11 +11,19 @@ PVE 流量控制管理器 - 后台监控脚本
 """
 
 import sys
+import shlex
 import subprocess
 import datetime
 import db
 import pve
-from config import DB_PATH
+
+try:
+    import telegram_service
+except ImportError:  # 兼容从旧版升级但尚未补齐 Telegram 文件的节点
+    telegram_service = None
+
+
+SHUTDOWN_RETRY_SECONDS = 15 * 60
 
 
 def log(msg):
@@ -33,11 +41,11 @@ def execute_notify(notify_cmd, vm_id, vm_name, group_name, usage_mb, limit_mb, v
     cmd = notify_cmd
     # 如果命令中包含变量占位符，进行替换
     cmd = cmd.replace('{vm_id}', str(vm_id))
-    cmd = cmd.replace('{vm_name}', vm_name)
-    cmd = cmd.replace('{group}', group_name)
+    cmd = cmd.replace('{vm_name}', shlex.quote(str(vm_name)))
+    cmd = cmd.replace('{group}', shlex.quote(str(group_name)))
     cmd = cmd.replace('{usage}', f"{usage_mb:.2f}")
     cmd = cmd.replace('{limit}', f"{limit_mb:.2f}")
-    cmd = cmd.replace('{vm_type}', vm_type)
+    cmd = cmd.replace('{vm_type}', shlex.quote(str(vm_type)))
 
     try:
         # 使用 shell=True 以支持管道等复杂命令
@@ -62,31 +70,75 @@ def collect_traffic(vm_id, vm_type):
     返回: (delta_in_bytes, delta_out_bytes) 首次/正常采集
            None 表示 VM 不在运行状态，跳过
     """
-    netin, netout, status = pve.get_vm_network_traffic(vm_id, vm_type)
+    netin, netout, status, boot_time = pve.get_vm_network_snapshot(vm_id, vm_type)
 
     if status != 'running':
         return None
 
-    last_log = db.get_last_traffic_log(vm_id, vm_type)
+    # 采样日志和全部组汇总必须在同一事务内更新，避免中途失败后永久漏计。
+    return db.record_traffic_sample(
+        vm_id, vm_type, netin, netout, boot_time=boot_time
+    )
 
-    if last_log is None:
-        # 首次采集，记录基线但不计增量
-        db.insert_traffic_log(vm_id, vm_type, netin, netout, 0, 0)
-        return 0, 0
 
-    # 处理计数器归零（VM 重启导致 netin/netout 归零）
-    if netin < last_log['netin_bytes'] or netout < last_log['netout_bytes']:
-        # 计数器归零，本周期增量 = 当前值（因为是从0开始的）
-        delta_in = netin
-        delta_out = netout
+def _send_telegram_usage_notification(notification_type, vm_id, vm_type,
+                                      vm_name, group_id, group_name,
+                                      usage_mb, limit_mb):
+    """按 VM/组/流量周期去重发送 Telegram 预警或关机通知。"""
+    if telegram_service is None or not telegram_service.notifications_ready():
+        return False
+    if not db.claim_traffic_notification(
+        vm_id, vm_type, group_id, notification_type
+    ):
+        return False
+
+    percent = usage_mb * 100 / limit_mb if limit_mb > 0 else 0
+    type_label = 'KVM' if vm_type == 'qemu' else 'LXC'
+    if notification_type == 'warning':
+        title = '⚠️ PTM 流量预警'
+        ending = '请及时检查流量使用情况。'
+        action_name = 'telegram_warning'
     else:
-        delta_in = netin - last_log['netin_bytes']
-        delta_out = netout - last_log['netout_bytes']
+        title = '🛑 PTM 超限关机通知'
+        ending = 'PTM 已向 PVE 提交关机请求；用户重启后仅重置该机器的流量。'
+        action_name = 'telegram_shutdown'
+    text = (
+        f'{title}\n'
+        f"虚拟机：{type_label} {vm_id} '{vm_name or '-'}'\n"
+        f'管理组：{group_name}\n'
+        f'已用流量：{usage_mb:.2f} MB / {limit_mb:.2f} MB ({percent:.1f}%)\n'
+        f'{ending}'
+    )
+    ok, detail = telegram_service.send_message(text)
+    if not ok:
+        db.release_traffic_notification(
+            vm_id, vm_type, group_id, notification_type
+        )
+        log(f'  [Telegram 发送失败] {type_label} {vm_id}: {detail}')
+        return False
+    db.insert_action_log(
+        action_name, target_type='vm', target_id=vm_id,
+        detail=f'{group_name}: {usage_mb:.2f}/{limit_mb:.2f} MB ({percent:.1f}%)'
+    )
+    return True
 
-    # 写入日志
-    db.insert_traffic_log(vm_id, vm_type, netin, netout, delta_in, delta_out)
 
-    return delta_in, delta_out
+def check_usage_warning(vm_id, vm_type, vm_name, group_id, group_name,
+                        limit_mb, dry_run=False):
+    """达到预警比例后发送一次 Telegram 通知。"""
+    if dry_run or telegram_service is None or not telegram_service.notifications_ready():
+        return False
+    summary = db.get_vm_traffic_summary(vm_id, vm_type, group_id)
+    if not summary or limit_mb <= 0:
+        return False
+    total_mb = summary['total_in_mb'] + summary['total_out_mb']
+    percent = float(db.get_telegram_settings().get('warning_percent', 80))
+    if total_mb < limit_mb * percent / 100:
+        return False
+    return _send_telegram_usage_notification(
+        'warning', vm_id, vm_type, vm_name, group_id, group_name,
+        total_mb, limit_mb,
+    )
 
 
 def check_and_shutdown(vm_id, vm_type, vm_name, group_id, group_name, limit_mb, dry_run=False):
@@ -102,6 +154,18 @@ def check_and_shutdown(vm_id, vm_type, vm_name, group_id, group_name, limit_mb, 
 
     if total_mb < limit_mb:
         return False, f"未超限 ({total_mb:.2f}/{limit_mb:.2f} MB)"
+
+    shutdown_state = db.get_shutdown_state(vm_id, vm_type)
+    if shutdown_state:
+        if not dry_run and (
+            shutdown_state.get('group_id') is None
+            or shutdown_state.get('group_id') == group_id
+        ):
+            _send_telegram_usage_notification(
+                'shutdown', vm_id, vm_type, vm_name, group_id, group_name,
+                total_mb, limit_mb,
+            )
+        return False, "已有待完成的关机请求"
 
     # === 超限处理 ===
     type_label = 'KVM' if vm_type == 'qemu' else 'LXC'
@@ -129,12 +193,18 @@ def check_and_shutdown(vm_id, vm_type, vm_name, group_id, group_name, limit_mb, 
         ok, msg = pve.shutdown_vm(vm_id, vm_type)
         if ok:
             log(f"  [已关机] {type_label} {vm_id} '{vm_name}' (流量: {total_mb:.2f}/{limit_mb:.2f} MB)")
-            # 仅在成功关机后记录日志
             detail = f"{type_label} {vm_id} '{vm_name}' 超限关机: {total_mb:.2f}/{limit_mb:.2f} MB (组: {group_name})"
-            db.insert_action_log('shutdown', 'vm', vm_id, detail)
+            db.record_shutdown_success(
+                vm_id, vm_type, detail, pve.get_vm_boot_time(vm_status), group_id
+            )
+            _send_telegram_usage_notification(
+                'shutdown', vm_id, vm_type, vm_name, group_id, group_name,
+                total_mb, limit_mb,
+            )
         else:
             log(f"  [关机失败] {type_label} {vm_id} '{vm_name}': {msg}")
-        return ok, f"{'成功' if ok else '失败'}: {msg}"
+        # 已执行过通知和关机尝试；同一轮不应因 VM 属于多个组而重复执行。
+        return True, f"{'成功' if ok else '失败'}: {msg}"
 
 
 def check_auto_reset(vm_id, vm_type):
@@ -142,40 +212,68 @@ def check_auto_reset(vm_id, vm_type):
     检查VM是否被PTM超限关机后重新启动，如果是则自动重置流量
     返回: True 如果执行了重置
     """
-    # 1. 查最近一次关机记录
-    shutdown_log = db.get_last_shutdown_for_vm(vm_id)
-    if not shutdown_log:
+    state = db.get_shutdown_state(vm_id, vm_type)
+    if not state:
         return False
 
-    detail = shutdown_log.get('detail', '')
-    if '超限关机' not in detail:
-        return False  # 不是PTM关的，不重置
-
-    # 2. 检查是否已经处理过这次关机事件（防止重复重置）
-    last_reset = db.get_last_auto_reset_for_vm(vm_id)
-    if last_reset and last_reset.get('reset_at', '') >= shutdown_log.get('created_at', ''):
-        return False  # 已经重置过了，跳过
-
-    # 3. 检查VM当前是否在运行（说明已被手动重启）
+    # 必须先观察到 stopped，或确认启动时间已变化，才能认定发生了重启。
+    # qm/pct shutdown 返回成功时 VM 往往仍短暂处于 running，不能立即清零。
     status = pve.get_vm_status(vm_id, vm_type)
-    if not status or status.get('status') != 'running':
-        return False  # 还没启动，不重置
+    if not status:
+        return False
+    if status.get('status') != 'running':
+        if status.get('status') == 'stopped' and not state['stopped_seen']:
+            db.mark_shutdown_stopped(vm_id, vm_type)
+        return False
 
-    # 4. 自动重置该VM在每个组中的流量
+    current_boot_time = pve.get_vm_boot_time(status)
+    requested_boot_time = state.get('boot_time_at_request')
+    boot_changed = (
+        current_boot_time is not None
+        and requested_boot_time is not None
+        and abs(current_boot_time - requested_boot_time) > db.BOOT_TIME_TOLERANCE_SECONDS
+    )
+    if not state['stopped_seen'] and not boot_changed:
+        try:
+            requested_at = datetime.datetime.strptime(
+                state['requested_at'], '%Y-%m-%d %H:%M:%S'
+            )
+            age = (datetime.datetime.now() - requested_at).total_seconds()
+        except (TypeError, ValueError):
+            age = 0
+        if age >= SHUTDOWN_RETRY_SECONDS:
+            db.clear_shutdown_state(vm_id, vm_type)
+            log(f"  [警告] {vm_type.upper()} {vm_id} 关机请求超时，将允许下轮重试")
+        return False
+
     type_label = 'KVM' if vm_type == 'qemu' else 'LXC'
-    groups = db.get_vm_groups(vm_id, vm_type)
+    detail = f"自动重置: {type_label} {vm_id} 超限关机后重启"
+    groups = db.auto_reset_vm_traffic(vm_id, vm_type, detail)
     for g in groups:
-        db.reset_vm_traffic(vm_id, vm_type, g['group_id'])
         log(f"  [自动重置] {type_label} {vm_id} 检测到PTM超限关机后重启，已重置流量 (组: {g['group_name']})")
-
-    # 记录操作日志
-    db.insert_action_log('reset', 'vm', vm_id,
-                         f"自动重置: {type_label} {vm_id} 超限关机后重启")
 
     return True
 
 
+def _acquire_monitor_lock():
+    """非阻塞获取进程锁；返回文件句柄，None 表示已有监控在运行。"""
+    return db.acquire_monitor_lock()
+
+
 def run_monitor(dry_run=False, collect_only=False):
+    """带单实例锁执行监控，避免重叠任务重复计费或关机。"""
+    lock_handle = _acquire_monitor_lock()
+    if lock_handle is None:
+        log("已有监控任务正在运行，本次跳过")
+        return False
+    try:
+        _run_monitor(dry_run, collect_only)
+        return True
+    finally:
+        db.release_monitor_lock(lock_handle)
+
+
+def _run_monitor(dry_run=False, collect_only=False):
     """执行一次完整的监控循环"""
     if collect_only:
         mode = "仅采集模式"
@@ -193,9 +291,10 @@ def run_monitor(dry_run=False, collect_only=False):
 
     log(f"管理 {len(managed)} 台虚拟机")
 
-    # --- 自动重置检查 ---
-    for vm in managed:
-        check_auto_reset(vm['vm_id'], vm['vm_type'])
+    # 演习/仅采集模式不执行任何自动重置副作用。
+    if not dry_run and not collect_only:
+        for vm in managed:
+            check_auto_reset(vm['vm_id'], vm['vm_type'])
 
     # --- 采集流量 ---
     for vm in managed:
@@ -211,12 +310,6 @@ def run_monitor(dry_run=False, collect_only=False):
 
         log(f"  {type_label} {vm_id} '{vm_name}': +{delta_in / 1024:.1f} KB in / +{delta_out / 1024:.1f} KB out")
 
-        # --- 更新各组流量汇总 ---
-        vm_groups = db.get_vm_groups(vm_id, vm_type)
-        for vg in vm_groups:
-            if delta_in > 0 or delta_out > 0:
-                db.update_traffic_summary(vm_id, vm_type, vg['group_id'], delta_in, delta_out)
-
     # --- 超限检查 (仅采集模式跳过) ---
     if collect_only:
         log("仅采集模式，跳过超限检查")
@@ -229,6 +322,11 @@ def run_monitor(dry_run=False, collect_only=False):
 
             vm_groups = db.get_vm_groups(vm_id, vm_type)
             for vg in vm_groups:
+                check_usage_warning(
+                    vm_id, vm_type, vm_name,
+                    vg['group_id'], vg['group_name'], vg['traffic_limit_mb'],
+                    dry_run,
+                )
                 action, detail = check_and_shutdown(
                     vm_id, vm_type, vm_name,
                     vg['group_id'], vg['group_name'], vg['traffic_limit_mb'],
@@ -236,6 +334,7 @@ def run_monitor(dry_run=False, collect_only=False):
                 )
                 if action:
                     log(f"  [超限] 组 '{vg['group_name']}' :: {detail}")
+                    break
 
     log("=== PVE 流量监控结束 ===")
 
@@ -252,3 +351,4 @@ if __name__ == '__main__':
         log(f"监控异常: {e}")
         import traceback
         traceback.print_exc()
+        sys.exit(1)

@@ -13,6 +13,11 @@ PVE 流量控制管理器 - 一键升级脚本
 import os
 import sys
 import shutil
+import io
+import stat
+import sqlite3
+import tempfile
+import zipfile
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -21,6 +26,7 @@ from datetime import datetime
 REPO_OWNER = "smmya"
 REPO_NAME = "pve-traffic-manager"
 RAW_URL = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/refs/heads/main"
+ARCHIVE_URL = f"https://codeload.github.com/{REPO_OWNER}/{REPO_NAME}/zip/refs/heads/main"
 
 SOURCE_FILES = [
     "manager.py",
@@ -28,6 +34,9 @@ SOURCE_FILES = [
     "db.py",
     "pve.py",
     "config.py",
+    "telegram_service.py",
+    "telegram_bot.py",
+    "requirements.txt",
     "upgrade.py",
     "VERSION",
 ]
@@ -77,8 +86,9 @@ def compare_versions(v1, v2):
     try:
         p1 = [int(x) for x in v1.strip().split(".")]
         p2 = [int(x) for x in v2.strip().split(".")]
-        while len(p1) < 3: p1.append(0)
-        while len(p2) < 3: p2.append(0)
+        max_parts = max(3, len(p1), len(p2))
+        while len(p1) < max_parts: p1.append(0)
+        while len(p2) < max_parts: p2.append(0)
         for a, b in zip(p1, p2):
             if a > b: return 1
             if a < b: return -1
@@ -93,8 +103,33 @@ def backup_data():
         return True
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = os.path.join(BASE_DIR, f"data.bak.{ts}")
+    suffix = 1
+    while os.path.exists(backup_path):
+        backup_path = os.path.join(BASE_DIR, f"data.bak.{ts}.{suffix}")
+        suffix += 1
     try:
-        shutil.copytree(DATA_DIR, backup_path)
+        os.makedirs(backup_path)
+        db_name = "traffic.db"
+        source_db = os.path.join(DATA_DIR, db_name)
+        with os.scandir(DATA_DIR) as entries:
+            for entry in entries:
+                if entry.name in {db_name, f"{db_name}-wal", f"{db_name}-shm", "monitor.lock"}:
+                    continue
+                target = os.path.join(backup_path, entry.name)
+                if entry.is_dir(follow_symlinks=False):
+                    shutil.copytree(entry.path, target)
+                else:
+                    shutil.copy2(entry.path, target, follow_symlinks=False)
+
+        # SQLite 在线备份 API 可在 WAL 正在写入时生成一致快照。
+        if os.path.exists(source_db):
+            source_conn = sqlite3.connect(source_db, timeout=30)
+            target_conn = sqlite3.connect(os.path.join(backup_path, db_name))
+            try:
+                source_conn.backup(target_conn)
+            finally:
+                target_conn.close()
+                source_conn.close()
         log(f"数据已备份到: {backup_path}", "OK")
         # 清理旧备份，保留最近 5 个
         backups = sorted([d for d in os.listdir(BASE_DIR) if d.startswith("data.bak.") and os.path.isdir(os.path.join(BASE_DIR, d))])
@@ -105,24 +140,123 @@ def backup_data():
         return True
     except Exception as e:
         log(f"备份失败: {e}", "ERROR")
+        if os.path.isdir(backup_path):
+            shutil.rmtree(backup_path, ignore_errors=True)
         return False
 
 
-def download_file(filename):
-    url = f"{RAW_URL}/{filename}?_cb={int(datetime.now().timestamp())}"
+def download_source_files():
+    """一次下载完整源码快照，避免逐文件下载得到混合版本。"""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "pve-traffic-manager-upgrader"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return resp.read()
+        req = urllib.request.Request(
+            f"{ARCHIVE_URL}?_cb={int(datetime.now().timestamp())}",
+            headers={"User-Agent": "pve-traffic-manager-upgrader"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            archive = resp.read()
+        with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+            result = {}
+            names = zf.namelist()
+            for filename in SOURCE_FILES:
+                matches = [name for name in names if name.endswith(f"/{filename}")]
+                if len(matches) != 1:
+                    log(f"升级包中文件缺失或重复: {filename}", "ERROR")
+                    return None
+                result[filename] = zf.read(matches[0])
+        return result
     except urllib.error.HTTPError as e:
-        if e.code == 404:
-            log(f"远程文件不存在: {filename}", "WARN")
-        else:
-            log(f"下载失败 {filename} (HTTP {e.code})", "ERROR")
-        return None
+        log(f"下载升级包失败 (HTTP {e.code})", "ERROR")
+    except zipfile.BadZipFile:
+        log("下载的升级包不是有效 ZIP 文件", "ERROR")
     except Exception as e:
-        log(f"下载失败 {filename}: {e}", "ERROR")
-        return None
+        log(f"下载升级包失败: {e}", "ERROR")
+    return None
+
+
+def _version_from_content(content):
+    try:
+        for line in content.decode("utf-8").splitlines():
+            if line.strip().startswith("VERSION="):
+                return line.strip().split("=", 1)[1]
+    except (AttributeError, UnicodeDecodeError):
+        pass
+    return None
+
+
+def validate_source_files(source_files):
+    """在替换本地文件前验证完整性和 Python 语法。"""
+    if not source_files or set(source_files) != set(SOURCE_FILES):
+        log("升级包文件不完整", "ERROR")
+        return False
+    for filename, content in source_files.items():
+        if not content:
+            log(f"升级包文件为空: {filename}", "ERROR")
+            return False
+        if filename.endswith(".py"):
+            try:
+                source = content.decode("utf-8")
+                compile(source, filename, "exec")
+            except (UnicodeDecodeError, SyntaxError) as exc:
+                log(f"升级包语法校验失败 {filename}: {exc}", "ERROR")
+                return False
+    return True
+
+
+def _atomic_write(filepath, content):
+    """在目标目录写临时文件，再以 os.replace 原子替换。"""
+    directory = os.path.dirname(filepath)
+    mode = None
+    if os.path.exists(filepath):
+        mode = stat.S_IMODE(os.stat(filepath).st_mode)
+    fd, temp_path = tempfile.mkstemp(prefix=".ptm-upgrade-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if mode is not None:
+            os.chmod(temp_path, mode)
+        os.replace(temp_path, filepath)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def install_source_files(source_files):
+    """事务式安装源码；任一替换失败时恢复全部原文件。"""
+    originals = {}
+    installed = []
+    for filename in SOURCE_FILES:
+        filepath = os.path.join(BASE_DIR, filename)
+        if os.path.exists(filepath):
+            with open(filepath, "rb") as handle:
+                originals[filename] = handle.read()
+        else:
+            originals[filename] = None
+
+    try:
+        for filename in SOURCE_FILES:
+            _atomic_write(os.path.join(BASE_DIR, filename), source_files[filename])
+            installed.append(filename)
+            log(f"已更新: {filename}", "OK")
+        return True
+    except Exception as exc:
+        log(f"写入升级文件失败: {exc}", "ERROR")
+        rollback_errors = []
+        for filename in reversed(installed):
+            try:
+                filepath = os.path.join(BASE_DIR, filename)
+                if originals[filename] is None:
+                    os.remove(filepath)
+                else:
+                    _atomic_write(filepath, originals[filename])
+            except Exception as rollback_exc:
+                rollback_errors.append(f"{filename}: {rollback_exc}")
+        if rollback_errors:
+            log(f"回滚失败: {'; '.join(rollback_errors)}", "ERROR")
+        else:
+            log("已恢复升级前的程序文件", "WARN")
+        return False
 
 
 def perform_upgrade(force=False):
@@ -133,9 +267,15 @@ def perform_upgrade(force=False):
     local_ver = get_local_version()
     log(f"本地版本: v{local_ver}")
 
-    remote_ver = get_remote_version()
+    log("正在下载并校验升级包...", "INFO")
+    source_files = download_source_files()
+    if not validate_source_files(source_files):
+        log("无法取得有效升级包，升级中止", "ERROR")
+        return False
+
+    remote_ver = _version_from_content(source_files["VERSION"])
     if remote_ver is None:
-        log("无法获取远程版本信息，升级中止", "ERROR")
+        log("升级包缺少有效版本信息，升级中止", "ERROR")
         return False
 
     log(f"远程版本: v{remote_ver}")
@@ -165,34 +305,15 @@ def perform_upgrade(force=False):
         log("数据备份失败，升级中止", "ERROR")
         return False
 
-    log("正在下载更新...", "INFO")
-    ok, fail = 0, []
-    for fname in SOURCE_FILES:
-        content = download_file(fname)
-        if content is None:
-            fail.append(fname)
-            continue
-        filepath = os.path.join(BASE_DIR, fname)
-        try:
-            with open(filepath, "wb") as f:
-                f.write(content)
-            log(f"已更新: {fname}", "OK")
-            ok += 1
-        except Exception as e:
-            log(f"写入失败 {fname}: {e}", "ERROR")
-            fail.append(fname)
-
     log("-" * 50)
-    if fail:
-        log(f"升级部分完成 ({ok}/{len(SOURCE_FILES)} 个文件成功)", "WARN")
-        log(f"失败文件: {', '.join(fail)}", "WARN")
-        log("数据目录已备份，可手动恢复", "INFO")
+    if not install_source_files(source_files):
+        log("升级失败，程序文件已尝试回滚；数据备份保持不变", "ERROR")
         return False
-    else:
-        log(f"升级成功! v{local_ver} -> v{remote_ver}", "OK")
-        print()
-        log("请重新运行程序以使用新版本", "INFO")
-        return True
+
+    log(f"升级成功! v{local_ver} -> v{remote_ver}", "OK")
+    print()
+    log("请重新运行程序以使用新版本", "INFO")
+    return True
 
 
 def main():

@@ -7,10 +7,18 @@ PVE 流量控制管理器 - CLI 前台交互主程序
 import os
 import sys
 import re
+import math
+import shlex
 import subprocess
+import getpass
 import db
 import pve
 from config import BASE_DIR, PYTHON_PATH, MONITOR_SCRIPT, DEFAULT_MONITOR_INTERVAL
+
+try:
+    import telegram_service
+except ImportError:  # 兼容旧升级器第一次未拉取新增文件的情况
+    telegram_service = None
 
 CRONTAB_MARKER = "# pve-traffic-manager monitor"
 
@@ -106,7 +114,10 @@ def input_number(prompt, allow_empty=False):
             val = input(prompt).strip()
             if allow_empty and val == '':
                 return None
-            return float(val)
+            number = float(val)
+            if not math.isfinite(number):
+                raise ValueError
+            return number
         except (EOFError, KeyboardInterrupt):
             print()
             return None
@@ -114,7 +125,22 @@ def input_number(prompt, allow_empty=False):
             print("  请输入有效数字")
 
 
-def input_vm_range(prompt):
+def input_integer(prompt, allow_empty=False):
+    """获取整数输入，拒绝小数、NaN 和无穷值。"""
+    while True:
+        try:
+            val = input(prompt).strip()
+            if allow_empty and val == '':
+                return None
+            return int(val)
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        except ValueError:
+            print("  请输入有效整数")
+
+
+def input_vm_range(prompt, available_vms=None):
     """
     解析虚拟机范围输入
     支持格式: 100, 100-110, 100,102,105-110
@@ -125,13 +151,17 @@ def input_vm_range(prompt):
         return []
 
     # 获取所有可用虚拟机用于匹配
-    all_vms = pve.get_all_vms()
+    all_vms = pve.get_all_vms() if available_vms is None else available_vms
     vm_map = {}  # key: str(vmid), value: list of (vmid, vm_type)
     for vm in all_vms:
-        key = str(vm['vmid'])
+        vmid = vm.get('vmid', vm.get('vm_id'))
+        vm_type = vm.get('type', vm.get('vm_type'))
+        if vmid is None or vm_type not in ('qemu', 'lxc'):
+            continue
+        key = str(vmid)
         if key not in vm_map:
             vm_map[key] = []
-        vm_map[key].append((vm['vmid'], vm['type']))
+        vm_map[key].append((vmid, vm_type))
 
     result = []
     parts = re.split(r'[,，]', raw)
@@ -146,14 +176,24 @@ def input_vm_range(prompt):
             start, end = int(range_match.group(1)), int(range_match.group(2))
             if start > end:
                 start, end = end, start
-            for vmid in range(start, end + 1):
+            available_ids = sorted(
+                int(key) for key in vm_map
+                if start <= int(key) <= end
+            )
+            for vmid in available_ids:
                 key = str(vmid)
-                if key in vm_map:
-                    for v in vm_map[key]:
-                        if v not in result:
-                            result.append(v)
+                for v in vm_map[key]:
+                    if v not in result:
+                        result.append(v)
+            missing_count = end - start + 1 - len(available_ids)
+            if missing_count:
+                if missing_count <= 20:
+                    available_set = set(available_ids)
+                    for vmid in range(start, end + 1):
+                        if vmid not in available_set:
+                            print(f"  [警告] VMID {vmid} 不存在，已跳过")
                 else:
-                    print(f"  [警告] VMID {vmid} 不存在，已跳过")
+                    print(f"  [警告] 范围内有 {missing_count} 个 VMID 不存在，已跳过")
         else:
             # 单个 VMID
             try:
@@ -273,10 +313,9 @@ def _modify_group():
     for g in groups:
         print(f"  [{g['id']}] {g['name']} (限额: {format_gb(g['traffic_limit_mb'])})")
 
-    gid = input_number("\n  请输入要修改的组ID: ")
+    gid = input_integer("\n  请输入要修改的组ID: ")
     if gid is None:
         return
-    gid = int(gid)
 
     group = db.get_group_by_id(gid)
     if not group:
@@ -292,14 +331,18 @@ def _modify_group():
     print(f"  当前限额: {format_gb(group['traffic_limit_mb'])}")
     new_limit = input_number("  新限额 GB (直接回车保持不变): ", allow_empty=True)
     if new_limit is not None:
+        if new_limit <= 0:
+            print("  限额必须为正数")
+            input("  按回车返回...")
+            return
         new_limit = new_limit * 1024  # 转换为 MB 存储
 
     print(f"  当前通知命令: {group.get('notify_cmd', '-')}")
-    new_notify = input("  新通知命令 (直接回车保持不变): ").strip()
-    if not new_notify and group.get('notify_cmd'):
-        new_notify = None
-    elif not new_notify:
+    new_notify = input("  新通知命令 (回车保持不变，输入 - 清空): ").strip()
+    if new_notify == '-':
         new_notify = ''
+    elif not new_notify:
+        new_notify = None
 
     success, msg = db.update_group(gid, new_name, new_limit, new_notify)
     print(f"\n  [{('成功' if success else '失败')}] {msg}")
@@ -321,10 +364,9 @@ def _delete_group():
         vms = db.get_group_vms(g['id'])
         print(f"  [{g['id']}] {g['name']} (限额: {format_gb(g['traffic_limit_mb'])}, VM数: {len(vms)})")
 
-    gid = input_number("\n  请输入要删除的组ID: ")
+    gid = input_integer("\n  请输入要删除的组ID: ")
     if gid is None:
         return
-    gid = int(gid)
 
     group = db.get_group_by_id(gid)
     if not group:
@@ -354,10 +396,9 @@ def _view_group_vms():
     for g in groups:
         print(f"  [{g['id']}] {g['name']}")
 
-    gid = input_number("\n  请选择组ID: ")
+    gid = input_integer("\n  请选择组ID: ")
     if gid is None:
         return
-    gid = int(gid)
 
     group = db.get_group_by_id(gid)
     if not group:
@@ -454,6 +495,10 @@ def _scan_vms():
         input("\n  按回车返回...")
         return
 
+    # 顺便修复旧版本未保存名称的问题，并同步 PVE 中的名称变更。
+    for vm in all_vms:
+        db.update_vm_name(vm['vmid'], vm['type'], vm.get('name', ''))
+
     qemu_vms = [v for v in all_vms if v['type'] == 'qemu']
     lxc_vms = [v for v in all_vms if v['type'] == 'lxc']
 
@@ -498,10 +543,9 @@ def _add_vms_to_group():
         vms = db.get_group_vms(g['id'])
         print(f"  [{g['id']}] {g['name']} (限额: {format_gb(g['traffic_limit_mb'])}, 已有VM: {len(vms)})")
 
-    gid = input_number("\n  请选择目标组ID: ")
+    gid = input_integer("\n  请选择目标组ID: ")
     if gid is None:
         return
-    gid = int(gid)
 
     group = db.get_group_by_id(gid)
     if not group:
@@ -511,7 +555,8 @@ def _add_vms_to_group():
 
     print(f"\n  目标组: {group['name']}")
     print("  输入格式示例: 100 或 100-110 或 100,102,105-110")
-    vms = input_vm_range("  请输入要加入的虚拟机: ")
+    all_vms = pve.get_all_vms()
+    vms = input_vm_range("  请输入要加入的虚拟机: ", all_vms)
 
     if not vms:
         print("  未选择任何虚拟机")
@@ -528,26 +573,44 @@ def _add_vms_to_group():
         input("  按回车返回...")
         return
 
-    success_count = 0
-    for vmid, vm_type in vms:
-        # 获取该VM当前PVE流量计数器，作为初始流量
-        initial_in_mb = 0
-        initial_out_mb = 0
-        netin, netout, vm_status = pve.get_vm_network_traffic(vmid, vm_type)
-        if netin is not None and netout is not None:
-            initial_in_mb = netin / (1024 * 1024)
-            initial_out_mb = netout / (1024 * 1024)
-            # 记录基线日志，后续采集从这里计算增量
-            db.insert_traffic_log(vmid, vm_type, netin, netout, 0, 0)
+    monitor_lock = db.acquire_monitor_lock()
+    if monitor_lock is None:
+        print("  [忙碌] 后台监控正在采样，请稍后重试")
+        input("  按回车返回...")
+        return
 
-        success, msg = db.add_vm_to_group(gid, vmid, vm_type,
-                                          initial_in_mb=initial_in_mb,
-                                          initial_out_mb=initial_out_mb)
-        if success:
-            success_count += 1
-            print(f"  [成功] {vm_type.upper()} {vmid} 已加入组 '{group['name']}' (初始: {(initial_in_mb + initial_out_mb) / 1024:.1f} GB)")
-        else:
-            print(f"  [跳过] {vm_type.upper()} {vmid}: {msg}")
+    success_count = 0
+    vm_info = {(vm['vmid'], vm['type']): vm for vm in all_vms}
+    try:
+        for vmid, vm_type in vms:
+            # 获取该VM当前PVE流量计数器，作为初始流量
+            initial_in_mb = 0
+            initial_out_mb = 0
+            netin, netout, vm_status, boot_time = pve.get_vm_network_snapshot(vmid, vm_type)
+            baseline_in = None
+            baseline_out = None
+            if vm_status == 'running' and netin is not None and netout is not None:
+                initial_in_mb = netin / (1024 * 1024)
+                initial_out_mb = netout / (1024 * 1024)
+                baseline_in = netin
+                baseline_out = netout
+
+            success, msg = db.add_vm_to_group(
+                gid, vmid, vm_type,
+                vm_name=vm_info.get((vmid, vm_type), {}).get('name', ''),
+                initial_in_mb=initial_in_mb,
+                initial_out_mb=initial_out_mb,
+                baseline_in_bytes=baseline_in,
+                baseline_out_bytes=baseline_out,
+                boot_time=boot_time
+            )
+            if success:
+                success_count += 1
+                print(f"  [成功] {vm_type.upper()} {vmid} 已加入组 '{group['name']}' (初始: {(initial_in_mb + initial_out_mb) / 1024:.1f} GB)")
+            else:
+                print(f"  [跳过] {vm_type.upper()} {vmid}: {msg}")
+    finally:
+        db.release_monitor_lock(monitor_lock)
 
     db.insert_action_log('config_change', 'group', gid,
                          f"添加 {success_count} 台虚拟机到组 '{group['name']}'")
@@ -570,10 +633,9 @@ def _remove_vm_from_group():
         vms = db.get_group_vms(g['id'])
         print(f"  [{g['id']}] {g['name']} ({len(vms)} 台虚拟机)")
 
-    gid = input_number("\n  请选择组ID: ")
+    gid = input_integer("\n  请选择组ID: ")
     if gid is None:
         return
-    gid = int(gid)
 
     group = db.get_group_by_id(gid)
     if not group:
@@ -595,7 +657,10 @@ def _remove_vm_from_group():
         rows.append([str(i + 1), str(v['vm_id']), type_label, v['vm_name']])
     print_table(headers, rows)
 
-    vms_to_remove = input_vm_range("  请输入要移除的虚拟机 (支持范围): ")
+    # 使用组内记录解析，确保已从 PVE 删除的 VM 仍可解除管理。
+    vms_to_remove = input_vm_range(
+        "  请输入要移除的虚拟机 (支持范围): ", vms
+    )
 
     if not vms_to_remove:
         print("  未选择任何虚拟机")
@@ -717,10 +782,9 @@ def _traffic_group_detail():
     for g in groups:
         print(f"  [{g['id']}] {g['name']}")
 
-    gid = input_number("\n  请选择组ID: ")
+    gid = input_integer("\n  请选择组ID: ")
     if gid is None:
         return
-    gid = int(gid)
 
     group = db.get_group_by_id(gid)
     if not group:
@@ -778,10 +842,9 @@ def _traffic_vm_detail():
     for i, v in enumerate(managed):
         print(f"  [{i + 1}] {v['vm_type'].upper()} {v['vm_id']} - {v['vm_name']} (组: {v['group_names']})")
 
-    idx = input_number("\n  请选择虚拟机 (输入VMID): ")
+    idx = input_integer("\n  请选择虚拟机 (输入VMID): ")
     if idx is None:
         return
-    idx = int(idx)
 
     vm_info = None
     vm_groups = []
@@ -848,10 +911,9 @@ def _reset_traffic():
         total = sum(v['total_in_mb'] + v['total_out_mb'] for v in vms)
         print(f"  [{g['id']}] {g['name']} (当前总流量: {format_gb(total)})")
 
-    gid = input_number("\n  请选择要重置的组ID: ")
+    gid = input_integer("\n  请选择要重置的组ID: ")
     if gid is None:
         return
-    gid = int(gid)
 
     group = db.get_group_by_id(gid)
     if not group:
@@ -877,8 +939,7 @@ def _traffic_history():
     managed = db.get_all_managed_vms()
     if managed:
         print("  可按 VMID 筛选，或直接回车查看所有记录")
-        vmid_input = input("  VMID (可选): ").strip()
-        vmid = int(vmid_input) if vmid_input else None
+        vmid = input_integer("  VMID (可选): ", allow_empty=True)
     else:
         vmid = None
 
@@ -952,15 +1013,22 @@ def menu_settings():
         installed, current = _crontab_status()
         crontab_status = "[已安装]" if installed else "[未安装]"
         shortcut_status = "[已安装]" if _shortcut_status() else "[未安装]"
+        tg_settings = db.get_telegram_settings()
+        telegram_status = (
+            "[已启用]" if tg_settings.get('enabled') else
+            "[已配置]" if tg_settings.get('bot_token') and tg_settings.get('chat_id') else
+            "[未配置]"
+        )
 
         print(f"  1. 查看当前配置")
         print(f"  2. 后台监控管理 {crontab_status}")
         print(f"  3. 查看操作日志")
         print(f"  4. 检查并升级程序")
         print(f"  5. 快捷指令管理 {shortcut_status}")
+        print(f"  6. Telegram 接入 {telegram_status}")
         print(f"  0. 返回主菜单")
 
-        choice = input_choice("  请选择 [0-5]: ", ['0', '1', '2', '3', '4', '5'])
+        choice = input_choice("  请选择 [0-6]: ", ['0', '1', '2', '3', '4', '5', '6'])
 
         if choice == '0':
             break
@@ -974,25 +1042,217 @@ def menu_settings():
             _upgrade_call()
         elif choice == '5':
             _shortcut_manage()
+        elif choice == '6':
+            _telegram_manage()
 
 
-def _run(cmd_list, timeout=10):
-    """执行命令，返回 (ok, stdout)"""
+def _telegram_service_label():
+    if telegram_service is None:
+        return '[组件缺失]'
+    status = telegram_service.get_bot_service_status()
+    if not status['supported']:
+        return '[不支持]'
+    if status['active']:
+        return '[运行中]'
+    if status['enabled']:
+        return '[已启用/未运行]'
+    return '[未安装]'
+
+
+def _print_telegram_diagnostics(result):
+    if telegram_service is None:
+        print('  Telegram 组件缺失；请运行 python3 upgrade.py --force 补齐程序文件。')
+        return
+    print()
+    for line in telegram_service.format_startup_status(result):
+        print(f'  {line}')
+    print(
+        f"  python-telegram-bot: "
+        f"{'[已安装] v' + result['dependency_detail'] if result['dependency_ok'] else '[未安装]'}"
+    )
+
+
+def _telegram_run_diagnostics(wait=True):
+    clear_screen()
+    print_header('Telegram 连接诊断')
+    if telegram_service is None:
+        _print_telegram_diagnostics({})
+        if wait:
+            input('\n  按回车返回...')
+        return None
+    print('  正在测试 Telegram HTTPS 网络、Bot Token 和授权会话…')
     try:
-        r = subprocess.run(cmd_list, capture_output=True, text=True, timeout=timeout)
-        return r.returncode == 0, r.stdout.strip()
-    except Exception:
-        return False, ""
+        result = telegram_service.diagnose_startup()
+        _print_telegram_diagnostics(result)
+    except Exception as exc:
+        result = None
+        token = db.get_telegram_settings().get('bot_token', '')
+        print(f'\n  [失败] 诊断异常: {telegram_service._safe_error(exc, token)}')
+    if wait:
+        input('\n  按回车返回...')
+    return result
+
+
+def _telegram_manage():
+    """Telegram 配置、诊断、依赖和长轮询服务管理。"""
+    while True:
+        clear_screen()
+        print_header('Telegram 接入管理')
+        settings = db.get_telegram_settings()
+        if telegram_service is None:
+            masked = '[组件缺失]'
+            dependency = '[未知]'
+        else:
+            masked = telegram_service.mask_token(settings.get('bot_token'))
+            dep_ok, dep_version = telegram_service.dependency_status()
+            dependency = f'[已安装] v{dep_version}' if dep_ok else '[未安装]'
+
+        print(f"  Bot Token: {masked}")
+        print(f"  推送会话 ID: {settings.get('chat_id') or '[未设置]'}")
+        print(f"  消息推送: {'[已启用]' if settings.get('enabled') else '[未启用]'}")
+        print(f"  预警阈值: {settings.get('warning_percent', 80):g}%")
+        print(f"  Python 依赖: {dependency}")
+        print(f"  Bot 后台服务: {_telegram_service_label()}")
+        print()
+        print('  1. 设置/更换 Bot Token')
+        print('  2. 设置推送与授权会话 ID')
+        print('  3. 启用/停用 Telegram 推送')
+        print('  4. 修改流量预警比例')
+        print('  5. 运行网络、Token 与会话诊断')
+        print('  6. 发送测试消息')
+        print('  7. 安装/更新 Telegram Python 依赖')
+        print('  8. 安装/重启 Bot 后台服务')
+        print('  9. 卸载 Bot 后台服务')
+        print('  0. 返回')
+
+        choice = input_choice('  请选择 [0-9]: ', [str(i) for i in range(10)])
+        if choice == '0':
+            break
+        if choice == '1':
+            try:
+                token = getpass.getpass('  输入 Bot Token（输入 clear 清除，留空取消）: ').strip()
+            except (EOFError, KeyboardInterrupt):
+                token = ''
+            if token:
+                value = '' if token.lower() == 'clear' else token
+                ok, message = db.update_telegram_settings(bot_token=value)
+                print(f"\n  [{'成功' if ok else '失败'}] {message}")
+                if ok:
+                    db.insert_action_log(
+                        'config_change', target_type='system',
+                        detail='更新 Telegram Bot Token（内容已隐藏）',
+                    )
+            else:
+                print('\n  已取消')
+            input('\n  按回车继续...')
+        elif choice == '2':
+            chat_id = input('  输入会话 ID（群组通常为负数，输入 clear 清除）: ').strip()
+            value = '' if chat_id.lower() == 'clear' else chat_id
+            ok, message = db.update_telegram_settings(chat_id=value)
+            print(f"\n  [{'成功' if ok else '失败'}] {message}")
+            if ok:
+                db.insert_action_log(
+                    'config_change', target_type='system',
+                    detail=f"更新 Telegram 会话 ID: {value or '[已清除]'}",
+                )
+            input('\n  按回车继续...')
+        elif choice == '3':
+            target = not bool(settings.get('enabled'))
+            if target and (not settings.get('bot_token') or not settings.get('chat_id')):
+                print('\n  [失败] 请先配置 Bot Token 和会话 ID')
+            else:
+                ok, message = db.update_telegram_settings(enabled=target)
+                print(f"\n  [{'成功' if ok else '失败'}] {message}")
+                if ok:
+                    db.insert_action_log(
+                        'config_change', target_type='system',
+                        detail=f"{'启用' if target else '停用'} Telegram 推送",
+                    )
+            input('\n  按回车继续...')
+        elif choice == '4':
+            percent = input_number('  输入预警比例 (1-99，默认 80): ')
+            if percent is not None:
+                ok, message = db.update_telegram_settings(warning_percent=percent)
+                print(f"\n  [{'成功' if ok else '失败'}] {message}")
+                if ok:
+                    db.insert_action_log(
+                        'config_change', target_type='system',
+                        detail=f'设置 Telegram 流量预警比例为 {percent:g}%',
+                    )
+            input('\n  按回车继续...')
+        elif choice == '5':
+            _telegram_run_diagnostics()
+        elif choice == '6':
+            if telegram_service is None:
+                print('\n  [失败] Telegram 组件缺失')
+            else:
+                ok, message = telegram_service.send_message(
+                    '✅ PVE Traffic Manager Telegram 测试成功。', force=True
+                )
+                print(f"\n  [{'成功' if ok else '失败'}] {message}")
+            input('\n  按回车继续...')
+        elif choice == '7':
+            if telegram_service is None:
+                print('\n  [失败] Telegram 组件缺失，请先补齐升级文件')
+            elif confirm_action('  将通过 pip 安装 requirements.txt，继续?'):
+                print('  正在安装依赖，请稍候…')
+                ok, message = telegram_service.install_dependency()
+                print(f"\n  [{'成功' if ok else '失败'}] {message}")
+            input('\n  按回车继续...')
+        elif choice == '8':
+            if telegram_service is None:
+                print('\n  [失败] Telegram 组件缺失')
+            else:
+                ok, message = telegram_service.install_bot_service()
+                print(f"\n  [{'成功' if ok else '失败'}] {message}")
+                if ok:
+                    db.insert_action_log(
+                        'config_change', target_type='system',
+                        detail='安装/重启 Telegram Bot systemd 服务',
+                    )
+            input('\n  按回车继续...')
+        elif choice == '9':
+            if telegram_service is None:
+                print('\n  [失败] Telegram 组件缺失')
+            elif confirm_action('  确认停止并卸载 Telegram Bot 后台服务?'):
+                ok, message = telegram_service.uninstall_bot_service()
+                print(f"\n  [{'成功' if ok else '失败'}] {message}")
+                if ok:
+                    db.insert_action_log(
+                        'config_change', target_type='system',
+                        detail='卸载 Telegram Bot systemd 服务',
+                    )
+            input('\n  按回车继续...')
+
+
+def _read_crontab():
+    """安全读取 crontab；区分“尚无任务”和真实读取错误。"""
+    try:
+        result = subprocess.run(
+            ['crontab', '-l'], capture_output=True, text=True, timeout=10
+        )
+    except Exception as exc:
+        return False, "", str(exc)
+    if result.returncode == 0:
+        return True, result.stdout.strip(), ""
+    error = result.stderr.strip()
+    if result.returncode == 1 and 'no crontab for' in error.lower():
+        return True, "", ""
+    return False, "", error or f"crontab -l 返回码 {result.returncode}"
 
 
 def _crontab_status():
     """检查 crontab 是否已安装"""
-    ok, stdout = _run(['crontab', '-l'])
+    ok, stdout, _ = _read_crontab()
     if not ok:
         return False, ""
-    for line in stdout.splitlines():
-        if CRONTAB_MARKER in line:
-            return True, line.strip()
+    matching = [
+        line.strip() for line in stdout.splitlines()
+        if CRONTAB_MARKER in line
+    ]
+    for line in matching:
+        if line and not line.startswith('#'):
+            return True, line
     return False, ""
 
 
@@ -1044,25 +1304,35 @@ def _crontab_install():
     print_header("安装后台监控")
 
     # 选择间隔
-    interval = input_number(f"  监控间隔(分钟) [默认{DEFAULT_MONITOR_INTERVAL}]: ", allow_empty=True)
+    interval = input_integer(
+        f"  监控间隔(分钟，1-59) [默认{DEFAULT_MONITOR_INTERVAL}]: ",
+        allow_empty=True
+    )
     if interval is None:
         interval = DEFAULT_MONITOR_INTERVAL
-    interval = int(interval)
-    if interval < 1:
-        interval = 1
+    if not 1 <= interval <= 59:
+        print("\n  [失败] crontab 的分钟间隔必须在 1-59 之间")
+        input("\n  按回车返回...")
+        return
 
-    cron_line = f"*/{interval} * * * * {PYTHON_PATH} {MONITOR_SCRIPT} {CRONTAB_MARKER}"
+    cron_line = (
+        f"*/{interval} * * * * {shlex.quote(PYTHON_PATH)} "
+        f"{shlex.quote(MONITOR_SCRIPT)} {CRONTAB_MARKER}"
+    )
 
     # 读取现有 crontab
-    ok, stdout = _run(['crontab', '-l'])
-    existing_lines = stdout.splitlines() if ok and stdout else []
+    ok, stdout, error = _read_crontab()
+    if not ok:
+        print(f"\n  [失败] 无法读取现有 crontab，未做任何修改: {error}")
+        input("\n  按回车返回...")
+        return
+    existing_lines = stdout.splitlines() if stdout else []
 
     # 移除旧条目
     new_lines = [l for l in existing_lines if CRONTAB_MARKER not in l]
 
     # 添加新条目
     new_lines.append("")
-    new_lines.append(f"{CRONTAB_MARKER}")
     new_lines.append(cron_line)
     new_lines.append("")
 
@@ -1094,8 +1364,12 @@ def _crontab_uninstall():
         input("  按回车返回...")
         return
 
-    ok, stdout = _run(['crontab', '-l'])
-    existing_lines = stdout.splitlines() if ok and stdout else []
+    ok, stdout, error = _read_crontab()
+    if not ok:
+        print(f"\n  [失败] 无法读取现有 crontab，未做任何修改: {error}")
+        input("\n  按回车返回...")
+        return
+    existing_lines = stdout.splitlines() if stdout else []
 
     new_lines = [l for l in existing_lines if CRONTAB_MARKER not in l]
 
@@ -1140,7 +1414,7 @@ def _crontab_run_once():
     try:
         proc = subprocess.run(
             [PYTHON_PATH, MONITOR_SCRIPT],
-            capture_output=True, text=True, timeout=120
+            capture_output=True, text=True
         )
         output = proc.stdout.strip()
         errors = proc.stderr.strip()
@@ -1154,8 +1428,6 @@ def _crontab_run_once():
             print(f"\n  [完成] 监控执行完毕")
         else:
             print(f"\n  [警告] 执行返回码: {proc.returncode}")
-    except subprocess.TimeoutExpired:
-        print("  [超时] 监控执行超时")
     except Exception as e:
         print(f"  [错误] {e}")
 
@@ -1215,7 +1487,7 @@ def _shortcut_install():
 
     script_content = f"""#!/bin/bash
 # pve-traffic-manager shortcut
-cd "{BASE_DIR}" && exec "{PYTHON_PATH}" "{os.path.join(BASE_DIR, 'manager.py')}" "$@"
+cd {shlex.quote(BASE_DIR)} && exec {shlex.quote(PYTHON_PATH)} {shlex.quote(os.path.join(BASE_DIR, 'manager.py'))} "$@"
 """
 
     try:
@@ -1278,6 +1550,16 @@ def _view_config():
     print(f"  管理组数量: {len(groups)}")
     print(f"  管理虚拟机: {len(managed)}")
 
+    tg = db.get_telegram_settings()
+    token_display = (
+        telegram_service.mask_token(tg.get('bot_token'))
+        if telegram_service is not None else '[组件缺失]'
+    )
+    print(f"  Telegram Token: {token_display}")
+    print(f"  Telegram 会话: {tg.get('chat_id') or '[未设置]'}")
+    print(f"  Telegram 推送: {'[已启用]' if tg.get('enabled') else '[未启用]'}")
+    print(f"  Telegram 预警: {tg.get('warning_percent', 80):g}%")
+
     print(f"\n  各组流量限额:")
     for g in groups:
         vms = db.get_group_vms(g['id'])
@@ -1324,7 +1606,7 @@ def _view_action_logs():
 #  主菜单
 # ============================================================
 
-def main_menu():
+def main_menu(startup_telegram=None):
     """主菜单循环"""
     while True:
         clear_screen()
@@ -1333,6 +1615,15 @@ def main_menu():
         groups = db.get_all_groups()
         managed = db.get_all_managed_vms()
         print(f"  管理组: {len(groups)} | 管理虚拟机: {len(managed)}")
+        if startup_telegram:
+            for line in telegram_service.format_startup_status(startup_telegram):
+                print(f'  {line}')
+            print(
+                f"  Telegram 推送: "
+                f"{'[已启用]' if startup_telegram.get('enabled') else '[未启用]'}"
+            )
+        elif telegram_service is None:
+            print('  Telegram: [组件缺失，请运行 upgrade.py --force]')
         print()
 
         print("  1. 组管理")
@@ -1363,4 +1654,18 @@ def main_menu():
 if __name__ == '__main__':
     # 初始化数据库
     db.init_db()
-    main_menu()
+    startup_telegram = None
+    if telegram_service is not None:
+        print('正在检查 Telegram 网络、Bot Token 与授权会话…')
+        try:
+            startup_telegram = telegram_service.diagnose_startup()
+        except Exception as exc:
+            token = db.get_telegram_settings().get('bot_token', '')
+            startup_telegram = {
+                'network_ok': False,
+                'network_detail': telegram_service._safe_error(exc, token),
+                'token_ok': None, 'token_detail': '未测试',
+                'chat_ok': None, 'chat_detail': '未测试',
+                'enabled': False,
+            }
+    main_menu(startup_telegram)

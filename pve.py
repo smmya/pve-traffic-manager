@@ -7,6 +7,7 @@ PVE 流量控制管理器 - PVE API 交互封装
 import os
 import subprocess
 import json
+import time
 from config import PVE_NODE
 
 
@@ -41,11 +42,17 @@ def get_all_qemu_vms():
         return []
     try:
         vms = json.loads(stdout)
+        if not isinstance(vms, list):
+            return []
         result = []
         for vm in vms:
+            try:
+                vmid = int(vm['vmid'])
+            except (KeyError, TypeError, ValueError):
+                continue
             result.append({
-                'vmid': vm.get('vmid'),
-                'name': vm.get('name', ''),
+                'vmid': vmid,
+                'name': vm.get('name') or '',
                 'status': vm.get('status', 'unknown'),
                 'type': 'qemu'
             })
@@ -63,11 +70,17 @@ def get_all_lxc_vms():
         return []
     try:
         vms = json.loads(stdout)
+        if not isinstance(vms, list):
+            return []
         result = []
         for vm in vms:
+            try:
+                vmid = int(vm['vmid'])
+            except (KeyError, TypeError, ValueError):
+                continue
             result.append({
-                'vmid': vm.get('vmid'),
-                'name': vm.get('name', ''),
+                'vmid': vmid,
+                'name': vm.get('name') or '',
                 'status': vm.get('status', 'unknown'),
                 'type': 'lxc'
             })
@@ -92,7 +105,8 @@ def get_qemu_status(vmid):
     if not ok:
         return None
     try:
-        return json.loads(stdout)
+        status = json.loads(stdout)
+        return status if isinstance(status, dict) else None
     except json.JSONDecodeError:
         return None
 
@@ -106,7 +120,8 @@ def get_lxc_status(vmid):
     if not ok:
         return None
     try:
-        return json.loads(stdout)
+        status = json.loads(stdout)
+        return status if isinstance(status, dict) else None
     except json.JSONDecodeError:
         return None
 
@@ -120,34 +135,64 @@ def get_vm_status(vmid, vm_type):
     return None
 
 
-def get_vm_network_traffic(vmid, vm_type):
+def get_vm_boot_time(status, now=None):
+    """根据 PVE uptime 估算本次启动时间，用于识别计数器重启。"""
+    if not status:
+        return None
+    try:
+        uptime = max(0, int(status.get('uptime')))
+    except (TypeError, ValueError):
+        return None
+    return int(time.time() if now is None else now) - uptime
+
+
+def get_vm_network_snapshot(vmid, vm_type):
     """
-    获取虚拟机网络流量计数器
-    返回: (netin_bytes, netout_bytes, status) 或 (None, None, None)
+    获取虚拟机网络流量计数器和启动时间。
+    返回: (netin_bytes, netout_bytes, status, boot_time)
     netin/netout 是 PVE 启动以来的累计字节数
     """
     status = get_vm_status(vmid, vm_type)
     if status is None:
-        return None, None, None
+        return None, None, None, None
 
     vm_status = status.get('status', 'unknown')
+    boot_time = get_vm_boot_time(status)
     if vm_status != 'running':
-        return 0, 0, vm_status
+        return 0, 0, vm_status, boot_time
 
-    netin = status.get('netin', 0)
-    netout = status.get('netout', 0)
-    return netin, netout, vm_status
+    try:
+        netin = int(status['netin'])
+        netout = int(status['netout'])
+    except (TypeError, ValueError):
+        return None, None, None, boot_time
+    except KeyError:
+        return None, None, None, boot_time
+    if netin < 0 or netout < 0:
+        return None, None, None, boot_time
+    return netin, netout, vm_status, boot_time
+
+
+def get_vm_network_traffic(vmid, vm_type):
+    """兼容旧调用方，返回 (netin_bytes, netout_bytes, status)。"""
+    netin, netout, status, _ = get_vm_network_snapshot(vmid, vm_type)
+    return netin, netout, status
 
 
 def shutdown_qemu(vmid):
     """关闭 KVM 虚拟机"""
-    ok, stdout, stderr = _run_cmd([        'qm', 'shutdown', str(vmid)], timeout=30)
+    # 明确 PVE 等待上限，并给本地 subprocess 留出收尾余量。
+    ok, stdout, stderr = _run_cmd(
+        ['qm', 'shutdown', str(vmid), '--timeout', '60'], timeout=75
+    )
     return ok, stdout if ok else stderr
 
 
 def shutdown_lxc(vmid):
     """关闭 LXC 容器"""
-    ok, stdout, stderr = _run_cmd([        'pct', 'shutdown', str(vmid)], timeout=30)
+    ok, stdout, stderr = _run_cmd(
+        ['pct', 'shutdown', str(vmid), '--timeout', '60'], timeout=75
+    )
     return ok, stdout if ok else stderr
 
 
