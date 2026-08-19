@@ -32,6 +32,15 @@ def log(msg):
     print(f"[{ts}] {msg}")
 
 
+def refresh_vm_names():
+    """每轮从 PVE 同步受管 VM 名称，并自动修复旧版空名称记录。"""
+    refreshed = 0
+    for vm in pve.get_all_vms():
+        if db.update_vm_name(vm.get('vmid'), vm.get('type'), vm.get('name')):
+            refreshed += 1
+    return refreshed
+
+
 def execute_notify(notify_cmd, vm_id, vm_name, group_name, usage_mb, limit_mb, vm_type):
     """执行通知命令"""
     if not notify_cmd:
@@ -139,6 +148,80 @@ def check_usage_warning(vm_id, vm_type, vm_name, group_id, group_name,
         'warning', vm_id, vm_type, vm_name, group_id, group_name,
         total_mb, limit_mb,
     )
+
+
+def _group_shutdown_summary(group_id, status_cache=None, shutdown_cache=None):
+    """判断组内是否已无运行机器，且至少一台由 PTM 发起关机。"""
+    status_cache = status_cache if status_cache is not None else {}
+    shutdown_cache = shutdown_cache if shutdown_cache is not None else {}
+    vms = db.get_group_vms(group_id)
+    if not vms:
+        return None
+
+    ptm_shutdown_count = 0
+    for vm in vms:
+        key = (vm['vm_id'], vm['vm_type'])
+        if key not in shutdown_cache:
+            shutdown_cache[key] = db.get_shutdown_state(*key)
+        if shutdown_cache[key]:
+            # 该状态只会在 VM 原为 running、且 PVE 接受 PTM 关机请求后建立。
+            ptm_shutdown_count += 1
+            continue
+        if key not in status_cache:
+            status_cache[key] = pve.get_vm_status(*key)
+        status = status_cache[key]
+        if not status or status.get('status') != 'stopped':
+            return None
+
+    if ptm_shutdown_count == 0:
+        return None
+    return {
+        'vm_count': len(vms),
+        'ptm_shutdown_count': ptm_shutdown_count,
+        'already_stopped_count': len(vms) - ptm_shutdown_count,
+    }
+
+
+def check_group_all_shutdown_notifications():
+    """组内全部 VM 停止或进入 PTM 关机流程时，按流量周期通知一次。"""
+    if telegram_service is None or not telegram_service.notifications_ready():
+        return 0
+
+    sent = 0
+    status_cache = {}
+    shutdown_cache = {}
+    for group in db.get_all_groups():
+        if group.get('all_shutdown_notified'):
+            continue
+        summary = _group_shutdown_summary(
+            group['id'], status_cache=status_cache,
+            shutdown_cache=shutdown_cache,
+        )
+        if not summary or not db.claim_group_all_shutdown_notification(group['id']):
+            continue
+        text = (
+            '🛑 PTM 管理组已全部关机\n'
+            f"管理组：[{group['id']}] {group['name']}\n"
+            f"虚拟机数量：{summary['vm_count']}\n"
+            f"PTM 超限关机：{summary['ptm_shutdown_count']}\n"
+            f"原已停止：{summary['already_stopped_count']}\n"
+            '组内所有虚拟机均已停止，或已由 PTM 成功提交关机请求。\n'
+            '本流量周期不再重复通知；任一机器流量重置后可再次通知。'
+        )
+        ok, detail = telegram_service.send_message(text)
+        if not ok:
+            db.release_group_all_shutdown_notification(group['id'])
+            log(f"  [Telegram 全组关机通知失败] 组 {group['name']}: {detail}")
+            continue
+        db.insert_action_log(
+            'telegram_group_shutdown', target_type='group', target_id=group['id'],
+            detail=(
+                f"组内 {summary['vm_count']} 台均已停止或进入 PTM 关机流程，"
+                f"其中 {summary['ptm_shutdown_count']} 台由 PTM 关机"
+            ),
+        )
+        sent += 1
+    return sent
 
 
 def check_and_shutdown(vm_id, vm_type, vm_name, group_id, group_name, limit_mb, dry_run=False):
@@ -283,6 +366,9 @@ def _run_monitor(dry_run=False, collect_only=False):
         mode = "监控模式"
     log(f"=== PVE 流量监控开始 ({mode}) ===")
 
+    # 先同步 PVE 当前名称，修复旧版空名称并跟随名称变更。
+    refresh_vm_names()
+
     # 获取所有已管理的虚拟机
     managed = db.get_all_managed_vms()
     if not managed:
@@ -335,6 +421,9 @@ def _run_monitor(dry_run=False, collect_only=False):
                 if action:
                     log(f"  [超限] 组 '{vg['group_name']}' :: {detail}")
                     break
+
+        if not dry_run:
+            check_group_all_shutdown_notifications()
 
     log("=== PVE 流量监控结束 ===")
 

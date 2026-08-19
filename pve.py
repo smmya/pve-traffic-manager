@@ -34,6 +34,34 @@ def _run_cmd(cmd_list, timeout=15):
         return False, '', str(e)
 
 
+def get_vm_config_name(vmid, vm_type):
+    """从 VM 配置读取名称，兼容 LXC 列表不返回 name 的 PVE 版本。"""
+    if vm_type not in ('qemu', 'lxc'):
+        return ''
+    try:
+        vmid = int(vmid)
+    except (TypeError, ValueError):
+        return ''
+    ok, stdout, _ = _run_cmd([
+        'pvesh', 'get', f'/nodes/{PVE_NODE}/{vm_type}/{vmid}/config',
+        '--output-format', 'json'
+    ])
+    if not ok:
+        return ''
+    try:
+        config = json.loads(stdout)
+    except json.JSONDecodeError:
+        return ''
+    if not isinstance(config, dict):
+        return ''
+    keys = ('hostname', 'name') if vm_type == 'lxc' else ('name',)
+    for key in keys:
+        value = str(config.get(key) or '').strip()
+        if value:
+            return value
+    return ''
+
+
 def get_all_qemu_vms():
     """获取所有 KVM 虚拟机列表"""
     ok, stdout, stderr = _run_cmd([
@@ -51,9 +79,12 @@ def get_all_qemu_vms():
                 vmid = int(vm['vmid'])
             except (KeyError, TypeError, ValueError):
                 continue
+            name = str(vm.get('name') or '').strip()
+            if not name:
+                name = get_vm_config_name(vmid, 'qemu')
             result.append({
                 'vmid': vmid,
-                'name': vm.get('name') or '',
+                'name': name,
                 'status': vm.get('status', 'unknown'),
                 'type': 'qemu'
             })
@@ -79,9 +110,12 @@ def get_all_lxc_vms():
                 vmid = int(vm['vmid'])
             except (KeyError, TypeError, ValueError):
                 continue
+            name = str(vm.get('name') or vm.get('hostname') or '').strip()
+            if not name:
+                name = get_vm_config_name(vmid, 'lxc')
             result.append({
                 'vmid': vmid,
-                'name': vm.get('name') or '',
+                'name': name,
                 'status': vm.get('status', 'unknown'),
                 'type': 'lxc'
             })

@@ -76,6 +76,8 @@ def init_db():
             name            TEXT NOT NULL UNIQUE,
             traffic_limit_mb REAL NOT NULL,
             notify_cmd      TEXT DEFAULT '',
+            all_shutdown_notified INTEGER NOT NULL DEFAULT 0
+                CHECK(all_shutdown_notified IN (0,1)),
             created_at      TEXT DEFAULT (datetime('now','localtime'))
         );
 
@@ -212,6 +214,14 @@ def init_db():
             "ALTER TABLE traffic_summary ADD COLUMN shutdown_notified INTEGER NOT NULL DEFAULT 0"
         )
 
+    group_columns = {
+        row['name'] for row in cursor.execute("PRAGMA table_info(groups)").fetchall()
+    }
+    if 'all_shutdown_notified' not in group_columns:
+        cursor.execute(
+            "ALTER TABLE groups ADD COLUMN all_shutdown_notified INTEGER NOT NULL DEFAULT 0"
+        )
+
     shutdown_columns = {
         row['name'] for row in cursor.execute("PRAGMA table_info(shutdown_state)").fetchall()
     }
@@ -251,7 +261,9 @@ def get_all_groups():
     """获取所有组"""
     conn = get_conn()
     rows = conn.execute(
-        "SELECT id, name, traffic_limit_mb, notify_cmd, created_at FROM groups ORDER BY id"
+        """SELECT id, name, traffic_limit_mb, notify_cmd,
+                  all_shutdown_notified, created_at
+           FROM groups ORDER BY id"""
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -290,11 +302,18 @@ def update_group(group_id, name=None, traffic_limit_mb=None, notify_cmd=None):
     if not _is_positive_number(new_limit):
         conn.close()
         return False, "流量限额必须为正数"
+    reset_all_shutdown = (
+        traffic_limit_mb is not None
+        and float(new_limit) != float(group['traffic_limit_mb'])
+    )
 
     try:
         conn.execute(
-            "UPDATE groups SET name=?, traffic_limit_mb=?, notify_cmd=? WHERE id=?",
-            (new_name, new_limit, new_notify, group_id)
+            """UPDATE groups
+               SET name=?, traffic_limit_mb=?, notify_cmd=?,
+                   all_shutdown_notified=CASE WHEN ? THEN 0 ELSE all_shutdown_notified END
+               WHERE id=?""",
+            (new_name, new_limit, new_notify, 1 if reset_all_shutdown else 0, group_id)
         )
         conn.commit()
         return True, "更新成功"
@@ -370,6 +389,10 @@ def add_vm_to_group(group_id, vm_id, vm_type, vm_name='', initial_in_mb=0,
             conn.execute(
                 "INSERT INTO group_vms (group_id, vm_id, vm_type, vm_name) VALUES (?, ?, ?, ?)",
                 (group_id, vm_id, vm_type, vm_name)
+            )
+            conn.execute(
+                "UPDATE groups SET all_shutdown_notified=0 WHERE id=?",
+                (group_id,)
             )
             if vm_name:
                 conn.execute(
@@ -566,6 +589,9 @@ def reset_group_traffic(group_id):
            WHERE group_id=?""",
         (now, group_id)
     )
+    conn.execute(
+        "UPDATE groups SET all_shutdown_notified=0 WHERE id=?", (group_id,)
+    )
     conn.execute("DELETE FROM shutdown_state WHERE group_id=?", (group_id,))
     conn.commit()
     conn.close()
@@ -587,6 +613,9 @@ def reset_vm_traffic(vm_id, vm_type, group_id):
                warning_sent=0, shutdown_notified=0
            WHERE vm_id=? AND vm_type=? AND group_id=?""",
         (now, vm_id, vm_type, group_id)
+    )
+    conn.execute(
+        "UPDATE groups SET all_shutdown_notified=0 WHERE id=?", (group_id,)
     )
     conn.execute(
         """DELETE FROM shutdown_state
@@ -1117,16 +1146,45 @@ def release_traffic_notification(vm_id, vm_type, group_id, notification_type):
     conn.close()
 
 
-def update_vm_name(vm_id, vm_type, vm_name):
-    """刷新 VM 在所有组中的显示名称。"""
+def claim_group_all_shutdown_notification(group_id):
+    """原子认领一次全组关机通知。"""
+    conn = get_conn()
+    try:
+        with conn:
+            cursor = conn.execute(
+                """UPDATE groups SET all_shutdown_notified=1
+                   WHERE id=? AND all_shutdown_notified=0""",
+                (group_id,)
+            )
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
+def release_group_all_shutdown_notification(group_id):
+    """全组关机消息发送失败时释放认领，供下一轮重试。"""
     conn = get_conn()
     with conn:
         conn.execute(
-            """UPDATE group_vms SET vm_name=?
-               WHERE vm_id=? AND vm_type=?""",
-            (vm_name or '', vm_id, vm_type)
+            "UPDATE groups SET all_shutdown_notified=0 WHERE id=?", (group_id,)
         )
     conn.close()
+
+
+def update_vm_name(vm_id, vm_type, vm_name):
+    """刷新 VM 在所有组中的显示名称；空查询结果不覆盖已有名称。"""
+    vm_name = str(vm_name or '').strip()
+    if not vm_name:
+        return False
+    conn = get_conn()
+    with conn:
+        cursor = conn.execute(
+            """UPDATE group_vms SET vm_name=?
+               WHERE vm_id=? AND vm_type=?""",
+            (vm_name, vm_id, vm_type)
+        )
+    conn.close()
+    return cursor.rowcount > 0
 
 
 # ============================================================
@@ -1228,6 +1286,10 @@ def auto_reset_vm_traffic(vm_id, vm_type, detail=''):
                        VALUES (?, ?, ?, 'auto_restart')""",
                     (group['group_id'], vm_id, vm_type)
                 )
+                conn.execute(
+                    "UPDATE groups SET all_shutdown_notified=0 WHERE id=?",
+                    (group['group_id'],)
+                )
             conn.execute(
                 """UPDATE traffic_summary
                    SET total_in_mb=0, total_out_mb=0, last_reset=?,
@@ -1269,6 +1331,10 @@ def reset_vm_traffic_all_groups(vm_id, vm_type, detail='Telegram 手动重置'):
                        (group_id, vm_id, vm_type, reason)
                        VALUES (?, ?, ?, 'telegram_manual')""",
                     (group['group_id'], vm_id, vm_type)
+                )
+                conn.execute(
+                    "UPDATE groups SET all_shutdown_notified=0 WHERE id=?",
+                    (group['group_id'],)
                 )
             conn.execute(
                 """UPDATE traffic_summary
