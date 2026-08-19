@@ -77,6 +77,23 @@ class MonitorTestCase(unittest.TestCase):
         self.assertIn("'x; touch /tmp/bad'", command)
         self.assertIn("'g && false'", command)
 
+    def test_monitor_refreshes_vm_name_from_pve(self):
+        with mock.patch.object(
+            monitor.pve, "get_all_vms",
+            return_value=[{
+                "vmid": 100, "type": "qemu", "name": "current-name",
+                "status": "stopped",
+            }],
+        ), mock.patch.object(
+            monitor.pve, "get_vm_network_snapshot",
+            return_value=(0, 0, "stopped", None),
+        ):
+            monitor._run_monitor(collect_only=True)
+
+        self.assertEqual(
+            db.get_all_managed_vms()[0]["vm_name"], "current-name"
+        )
+
     def test_telegram_warning_is_sent_once_per_traffic_cycle(self):
         with mock.patch.object(
             monitor.telegram_service, "notifications_ready", return_value=True
@@ -150,6 +167,60 @@ class MonitorTestCase(unittest.TestCase):
 
         send.assert_called_once()
         self.assertIn("second", send.call_args.args[0])
+
+    def test_group_shutdown_allows_previously_stopped_members(self):
+        db.add_vm_to_group(
+            self.group_id, 101, "lxc", "already-stopped", initial_in_mb=0
+        )
+        db.record_shutdown_success(
+            100, "qemu", "PTM shutdown", 1000, self.group_id
+        )
+        with mock.patch.object(
+            monitor.telegram_service, "notifications_ready", return_value=True
+        ), mock.patch.object(
+            monitor.telegram_service, "send_message", return_value=(True, "ok")
+        ) as send, mock.patch.object(
+            monitor.pve, "get_vm_status", return_value={"status": "stopped"}
+        ) as status:
+            first = monitor.check_group_all_shutdown_notifications()
+            second = monitor.check_group_all_shutdown_notifications()
+
+        self.assertEqual(first, 1)
+        self.assertEqual(second, 0)
+        send.assert_called_once()
+        status.assert_called_once_with(101, "lxc")
+        self.assertIn("PTM 超限关机：1", send.call_args.args[0])
+        self.assertIn("原已停止：1", send.call_args.args[0])
+
+    def test_group_shutdown_requires_at_least_one_ptm_shutdown(self):
+        with mock.patch.object(
+            monitor.telegram_service, "notifications_ready", return_value=True
+        ), mock.patch.object(
+            monitor.telegram_service, "send_message", return_value=(True, "ok")
+        ) as send, mock.patch.object(
+            monitor.pve, "get_vm_status", return_value={"status": "stopped"}
+        ):
+            sent = monitor.check_group_all_shutdown_notifications()
+
+        self.assertEqual(sent, 0)
+        send.assert_not_called()
+
+    def test_group_shutdown_send_failure_is_retried(self):
+        db.record_shutdown_success(
+            100, "qemu", "PTM shutdown", 1000, self.group_id
+        )
+        with mock.patch.object(
+            monitor.telegram_service, "notifications_ready", return_value=True
+        ), mock.patch.object(
+            monitor.telegram_service, "send_message",
+            side_effect=[(False, "timeout"), (True, "ok")],
+        ) as send:
+            first = monitor.check_group_all_shutdown_notifications()
+            second = monitor.check_group_all_shutdown_notifications()
+
+        self.assertEqual(first, 0)
+        self.assertEqual(second, 1)
+        self.assertEqual(send.call_count, 2)
 
 
 if __name__ == "__main__":

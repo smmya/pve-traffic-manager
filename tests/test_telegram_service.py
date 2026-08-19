@@ -64,6 +64,29 @@ class TelegramServiceTestCase(unittest.TestCase):
         self.assertIn("--target", command)
         self.assertIn(telegram_service.PYTHON_PACKAGES_DIR, command)
 
+    def test_systemd_working_directory_is_unquoted_absolute_path(self):
+        unit = telegram_service.build_bot_service_unit(
+            "/root/pve-traffic-manager",
+            "/usr/bin/python3",
+            "/root/pve-traffic-manager/telegram_bot.py",
+        )
+        self.assertIn("WorkingDirectory=/root/pve-traffic-manager\n", unit)
+        self.assertNotIn('WorkingDirectory="', unit)
+
+    def test_systemd_working_directory_escapes_spaces(self):
+        unit = telegram_service.build_bot_service_unit(
+            "/root/pve traffic-manager",
+            "/usr/bin/python3",
+            "/root/pve traffic-manager/telegram_bot.py",
+        )
+        self.assertIn(r"WorkingDirectory=/root/pve\x20traffic-manager", unit)
+
+    def test_systemd_working_directory_rejects_relative_path(self):
+        with self.assertRaises(ValueError):
+            telegram_service.build_bot_service_unit(
+                "pve-traffic-manager", "python3", "telegram_bot.py"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

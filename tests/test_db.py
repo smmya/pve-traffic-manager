@@ -2,6 +2,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+import datetime
 
 import db
 
@@ -140,6 +141,9 @@ class DatabaseTestCase(unittest.TestCase):
         summary_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(traffic_summary)")
         }
+        group_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(groups)")
+        }
         state_table = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='shutdown_state'"
         ).fetchone()
@@ -149,13 +153,18 @@ class DatabaseTestCase(unittest.TestCase):
         telegram_table = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='telegram_settings'"
         ).fetchone()
+        network_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='network_check_settings'"
+        ).fetchone()
         conn.close()
         self.assertIn("boot_time", columns)
         self.assertIn("warning_sent", summary_columns)
         self.assertIn("shutdown_notified", summary_columns)
+        self.assertIn("all_shutdown_notified", group_columns)
         self.assertIsNotNone(state_table)
         self.assertIn("group_id", shutdown_columns)
         self.assertIsNotNone(telegram_table)
+        self.assertIsNotNone(network_table)
 
     def test_auto_restart_resets_only_target_vm_in_same_group(self):
         group_id = self.create_group()
@@ -180,8 +189,34 @@ class DatabaseTestCase(unittest.TestCase):
 
         self.assertTrue(db.claim_traffic_notification(100, "qemu", group_id, "warning"))
         self.assertFalse(db.claim_traffic_notification(100, "qemu", group_id, "warning"))
+        self.assertTrue(db.claim_traffic_notification(100, "qemu", group_id, "shutdown"))
+        self.assertFalse(db.claim_traffic_notification(100, "qemu", group_id, "shutdown"))
         db.reset_vm_traffic(100, "qemu", group_id)
         self.assertTrue(db.claim_traffic_notification(100, "qemu", group_id, "warning"))
+        self.assertTrue(db.claim_traffic_notification(100, "qemu", group_id, "shutdown"))
+
+    def test_group_shutdown_notification_claim_releases_and_resets(self):
+        group_id = self.create_group()
+        db.add_vm_to_group(group_id, 100, "lxc", "ct-100")
+
+        self.assertTrue(db.claim_group_all_shutdown_notification(group_id))
+        self.assertFalse(db.claim_group_all_shutdown_notification(group_id))
+        db.release_group_all_shutdown_notification(group_id)
+        self.assertTrue(db.claim_group_all_shutdown_notification(group_id))
+
+        db.reset_vm_traffic(100, "lxc", group_id)
+
+        self.assertEqual(
+            db.get_group_by_id(group_id)["all_shutdown_notified"], 0
+        )
+
+    def test_empty_name_refresh_does_not_erase_known_name(self):
+        group_id = self.create_group()
+        db.add_vm_to_group(group_id, 100, "lxc", "known-name")
+
+        self.assertFalse(db.update_vm_name(100, "lxc", ""))
+
+        self.assertEqual(db.get_group_vms(group_id)[0]["vm_name"], "known-name")
 
     def test_telegram_settings_validate_chat_and_warning_percent(self):
         self.assertFalse(db.update_telegram_settings(chat_id="not-an-id")[0])
@@ -198,6 +233,47 @@ class DatabaseTestCase(unittest.TestCase):
         self.assertEqual(settings["warning_percent"], 85)
         self.assertTrue(db.update_telegram_settings(chat_id="")[0])
         self.assertEqual(db.get_telegram_settings()["enabled"], 0)
+
+    def test_network_targets_are_validated_deduplicated_and_normalized(self):
+        ok, targets = db.normalize_network_targets(
+            "1.1.1.1; 8.8.8.8;1.1.1.1;2001:0db8::1"
+        )
+        self.assertTrue(ok)
+        self.assertEqual(targets, "1.1.1.1;8.8.8.8;2001:db8::1")
+        self.assertFalse(db.normalize_network_targets("example.com")[0])
+
+    def test_network_check_requires_target_and_respects_interval(self):
+        self.assertFalse(db.update_network_check_settings(enabled=True)[0])
+        self.assertTrue(db.update_network_check_settings(
+            targets="1.1.1.1;8.8.8.8", interval_hours=6, enabled=True
+        )[0])
+        now = datetime.datetime(2026, 8, 19, 12, 0, 0)
+        claimed, settings = db.try_claim_network_check(now=now)
+        self.assertTrue(claimed)
+        self.assertEqual(settings["target_list"], ["1.1.1.1", "8.8.8.8"])
+        db.finish_network_check("ok")
+        claimed, detail = db.try_claim_network_check(
+            now=now + datetime.timedelta(hours=1)
+        )
+        self.assertFalse(claimed)
+        self.assertIn("下次", detail)
+        self.assertTrue(db.try_claim_network_check(force=True, now=now)[0])
+        db.finish_network_check("manual")
+
+    def test_network_check_log_is_recorded(self):
+        db.record_network_check(100, "ct", "1.1.1.1", False, "timeout")
+        rows = db.get_network_check_logs(failures_only=True)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["vm_id"], 100)
+        self.assertEqual(rows[0]["success"], 0)
+
+    def test_interrupted_network_check_is_recovered_for_bot_restart(self):
+        db.update_network_check_settings(targets="1.1.1.1", enabled=True)
+        self.assertTrue(db.try_claim_network_check(force=True)[0])
+        self.assertTrue(db.recover_interrupted_network_check())
+        settings = db.get_network_check_settings()
+        self.assertEqual(settings["running"], 0)
+        self.assertIsNone(settings["last_started_at"])
 
 
 if __name__ == "__main__":
