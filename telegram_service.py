@@ -226,6 +226,43 @@ def _systemd_quote(value):
     return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
+def _systemd_path(value):
+    """生成 systemd 路径值；WorkingDirectory 不接受包裹路径的引号。"""
+    value = str(value)
+    if not value.startswith('/'):
+        raise ValueError(f'systemd 路径必须是绝对路径: {value}')
+    escaped = []
+    safe = '/._-'
+    for character in value:
+        if character.isascii() and (character.isalnum() or character in safe):
+            escaped.append(character)
+        elif character == '%':
+            escaped.append('%%')
+        else:
+            escaped.extend(f'\\x{byte:02x}' for byte in character.encode('utf-8'))
+    return ''.join(escaped)
+
+
+def build_bot_service_unit(base_dir=BASE_DIR, python_path=PYTHON_PATH,
+                           bot_script=TELEGRAM_BOT_SCRIPT):
+    """构建兼容 PVE 8/systemd 的 Bot 服务单元。"""
+    return f"""[Unit]
+Description=PVE Traffic Manager Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={_systemd_path(base_dir)}
+ExecStart={_systemd_quote(python_path)} {_systemd_quote(bot_script)}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
 def _run_systemctl(*args):
     result = subprocess.run(
         ['systemctl', *args], capture_output=True, text=True, timeout=30
@@ -248,21 +285,7 @@ def install_bot_service():
     if os.name == 'nt':
         return False, 'Bot 后台服务仅支持 Linux/systemd'
 
-    unit = f"""[Unit]
-Description=PVE Traffic Manager Telegram Bot
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory={_systemd_quote(BASE_DIR)}
-ExecStart={_systemd_quote(PYTHON_PATH)} {_systemd_quote(TELEGRAM_BOT_SCRIPT)}
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-"""
+    unit = build_bot_service_unit()
     directory = os.path.dirname(TELEGRAM_SERVICE_PATH)
     temp_path = None
     try:
