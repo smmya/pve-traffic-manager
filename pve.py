@@ -8,6 +8,7 @@ import os
 import subprocess
 import json
 import time
+import ipaddress
 from config import PVE_NODE
 
 
@@ -94,6 +95,32 @@ def get_all_vms():
     vms = get_all_qemu_vms() + get_all_lxc_vms()
     vms.sort(key=lambda x: x['vmid'])
     return vms
+
+
+def ping_from_lxc(vmid, target, count=3, timeout_seconds=3):
+    """通过 pct exec 在 LXC 网络命名空间内执行 ping。"""
+    try:
+        vmid = int(vmid)
+        address = ipaddress.ip_address(str(target).strip())
+        count = int(count)
+        timeout_seconds = int(timeout_seconds)
+    except (TypeError, ValueError):
+        return False, '无效的容器 ID、检测 IP 或 ping 参数'
+    if vmid <= 0 or count != 3 or timeout_seconds < 1:
+        return False, '网络检测必须发送 3 个 ping 请求'
+
+    ping_command = ['ping']
+    if address.version == 6:
+        ping_command.append('-6')
+    ping_command.extend([
+        '-c', str(count), '-W', str(timeout_seconds), str(address),
+    ])
+    ok, stdout, stderr = _run_cmd(
+        ['pct', 'exec', str(vmid), '--', *ping_command],
+        timeout=count * timeout_seconds + 15,
+    )
+    detail = stdout if ok else (stderr or stdout or '3 次 ping 均未收到响应')
+    return ok, detail[-1000:]
 
 
 def get_qemu_status(vmid):

@@ -4,6 +4,7 @@
 
 import asyncio
 import importlib.metadata
+import importlib.util
 import os
 import subprocess
 import tempfile
@@ -38,6 +39,8 @@ def mask_token(token):
 def dependency_status():
     try:
         version = importlib.metadata.version('python-telegram-bot')
+        if importlib.util.find_spec('apscheduler') is None:
+            return False, f'v{version}，缺少 job-queue 组件'
         return True, version
     except importlib.metadata.PackageNotFoundError:
         return False, '未安装'
@@ -346,7 +349,10 @@ def install_dependency():
         )
         if result.returncode == 0:
             return True, 'Telegram 依赖安装完成'
-        return False, result.stderr.strip() or result.stdout.strip()
+        detail = result.stderr.strip() or result.stdout.strip()
+        if 'No module named pip' in detail:
+            return False, '系统缺少 pip，请先执行: apt update && apt install -y python3-pip'
+        return False, detail
     except subprocess.TimeoutExpired:
         return False, '依赖安装超过 5 分钟，已中止'
     except Exception as exc:

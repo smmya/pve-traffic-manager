@@ -1105,7 +1105,12 @@ def _telegram_manage():
         else:
             masked = telegram_service.mask_token(settings.get('bot_token'))
             dep_ok, dep_version = telegram_service.dependency_status()
-            dependency = f'[已安装] v{dep_version}' if dep_ok else '[未安装]'
+            if dep_ok:
+                dependency = f'[已安装] v{dep_version}'
+            elif dep_version == '未安装':
+                dependency = '[未安装]'
+            else:
+                dependency = f'[不完整] {dep_version}'
 
         print(f"  Bot Token: {masked}")
         print(f"  推送会话 ID: {settings.get('chat_id') or '[未设置]'}")
@@ -1123,9 +1128,10 @@ def _telegram_manage():
         print('  7. 安装/更新 Telegram Python 依赖')
         print('  8. 安装/重启 Bot 后台服务')
         print('  9. 卸载 Bot 后台服务')
+        print('  10. LXC 网络状态检测管理')
         print('  0. 返回')
 
-        choice = input_choice('  请选择 [0-9]: ', [str(i) for i in range(10)])
+        choice = input_choice('  请选择 [0-10]: ', [str(i) for i in range(11)])
         if choice == '0':
             break
         if choice == '1':
@@ -1223,6 +1229,92 @@ def _telegram_manage():
                         detail='卸载 Telegram Bot systemd 服务',
                     )
             input('\n  按回车继续...')
+        elif choice == '10':
+            _network_check_manage()
+
+
+def _network_check_manage():
+    """配置由 Telegram Bot 服务执行的 LXC 网络检测。"""
+    while True:
+        clear_screen()
+        print_header('LXC 网络状态检测')
+        settings = db.get_network_check_settings()
+        print(f"  状态: {'[已启用]' if settings.get('enabled') else '[未启用]'}")
+        print(f"  检测 IP: {settings.get('targets') or '[未设置]'}")
+        print(f"  检测周期: {float(settings.get('interval_hours', 6)):g} 小时")
+        print('  检测范围: 全部正在运行的 LXC 容器')
+        print('  单容器规则: 随机选择一个 IP，发送 3 个 ping')
+        print('  容器间隔: 30 秒')
+        print(f"  上次开始: {settings.get('last_started_at') or '-'}")
+        print(f"  上次完成: {settings.get('last_completed_at') or '-'}")
+        print(f"  上次结果: {settings.get('last_result') or '-'}")
+        print()
+        print('  1. 设置检测 IP（多个使用 ; 分隔）')
+        print('  2. 设置检测周期')
+        print('  3. 启用/停用网络检测')
+        print('  4. 查看最近检测记录')
+        print('  0. 返回')
+        choice = input_choice('  请选择 [0-4]: ', ['0', '1', '2', '3', '4'])
+        if choice == '0':
+            break
+        if choice == '1':
+            value = input(
+                '  输入 IP（例如 1.1.1.1;8.8.8.8，输入 clear 清除）: '
+            ).strip()
+            if value.lower() == 'clear':
+                value = ''
+            ok, message = db.update_network_check_settings(targets=value)
+            print(f"\n  [{'成功' if ok else '失败'}] {message}")
+            if ok:
+                db.insert_action_log(
+                    'config_change', target_type='system',
+                    detail=f"更新 LXC 网络检测 IP: {value or '[已清除]'}",
+                )
+            input('\n  按回车继续...')
+        elif choice == '2':
+            hours = input_number('  输入检测周期（小时，默认 6，最短 1 分钟）: ')
+            if hours is not None:
+                ok, message = db.update_network_check_settings(interval_hours=hours)
+                print(f"\n  [{'成功' if ok else '失败'}] {message}")
+                if ok:
+                    db.insert_action_log(
+                        'config_change', target_type='system',
+                        detail=f'设置 LXC 网络检测周期为 {hours:g} 小时',
+                    )
+            input('\n  按回车继续...')
+        elif choice == '3':
+            target = not bool(settings.get('enabled'))
+            telegram = db.get_telegram_settings()
+            if target and not telegram.get('chat_id'):
+                print('\n  [失败] 请先配置 Telegram 推送会话 ID')
+            else:
+                ok, message = db.update_network_check_settings(enabled=target)
+                print(f"\n  [{'成功' if ok else '失败'}] {message}")
+                if ok:
+                    db.insert_action_log(
+                        'config_change', target_type='system',
+                        detail=f"{'启用' if target else '停用'} LXC 网络状态检测",
+                    )
+                    if target:
+                        print('  提示: 请确保已重新安装依赖并重启 Telegram Bot 服务。')
+            input('\n  按回车继续...')
+        elif choice == '4':
+            clear_screen()
+            print_header('最近 LXC 网络检测记录')
+            rows = db.get_network_check_logs(limit=50)
+            if not rows:
+                print('  暂无检测记录')
+            else:
+                table_rows = [
+                    [
+                        row['checked_at'], str(row['vm_id']), row.get('vm_name') or '-',
+                        row['target'], '正常' if row['success'] else '异常',
+                        (row.get('detail') or '')[:40],
+                    ]
+                    for row in rows
+                ]
+                print_table(['时间', 'CTID', '名称', 'IP', '结果', '详情'], table_rows)
+            input('\n  按回车返回...')
 
 
 def _read_crontab():

@@ -6,6 +6,8 @@ PVE 流量控制管理器 - 数据库操作层
 import sqlite3
 import os
 import math
+import datetime
+import ipaddress
 from config import DB_PATH, DATA_DIR, MONITOR_LOCK_PATH
 
 try:
@@ -155,12 +157,40 @@ def init_db():
             (id, bot_token, chat_id, enabled, warning_percent)
             VALUES (1, '', '', 0, 80);
 
+        CREATE TABLE IF NOT EXISTS network_check_settings (
+            id                INTEGER PRIMARY KEY CHECK(id = 1),
+            enabled           INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+            targets           TEXT NOT NULL DEFAULT '',
+            interval_hours    REAL NOT NULL DEFAULT 6,
+            running           INTEGER NOT NULL DEFAULT 0 CHECK(running IN (0,1)),
+            last_started_at   TEXT,
+            last_completed_at TEXT,
+            last_result       TEXT NOT NULL DEFAULT '',
+            updated_at        TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        );
+
+        INSERT OR IGNORE INTO network_check_settings
+            (id, enabled, targets, interval_hours, running)
+            VALUES (1, 0, '', 6, 0);
+
+        CREATE TABLE IF NOT EXISTS network_check_logs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            vm_id       INTEGER NOT NULL,
+            vm_name     TEXT,
+            target      TEXT NOT NULL,
+            success     INTEGER NOT NULL CHECK(success IN (0,1)),
+            detail      TEXT,
+            checked_at  TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        );
+
         CREATE INDEX IF NOT EXISTS idx_traffic_logs_vm_latest
             ON traffic_logs(vm_id, vm_type, id DESC);
         CREATE INDEX IF NOT EXISTS idx_action_logs_vm_latest
             ON action_logs(action, target_type, target_id, id DESC);
         CREATE INDEX IF NOT EXISTS idx_traffic_resets_vm_latest
             ON traffic_resets(vm_id, vm_type, reason, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_network_check_logs_latest
+            ON network_check_logs(id DESC);
     ''')
 
     # 从旧版本原地升级数据库。CREATE TABLE IF NOT EXISTS 不会补充新列。
@@ -806,6 +836,201 @@ def update_telegram_settings(bot_token=_UNSET, chat_id=_UNSET,
         return True, "Telegram 配置已更新"
     finally:
         conn.close()
+
+
+# ============================================================
+#  LXC 网络状态检测
+# ============================================================
+
+def normalize_network_targets(targets):
+    """校验并规范化分号分隔的 IPv4/IPv6 地址。"""
+    if isinstance(targets, (list, tuple)):
+        values = targets
+    else:
+        values = str(targets or '').split(';')
+    normalized = []
+    seen = set()
+    for raw_value in values:
+        value = str(raw_value).strip()
+        if not value:
+            continue
+        try:
+            value = str(ipaddress.ip_address(value))
+        except ValueError:
+            return False, f'无效 IP 地址: {value}'
+        if value not in seen:
+            seen.add(value)
+            normalized.append(value)
+    return True, ';'.join(normalized)
+
+
+def get_network_check_settings():
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT enabled, targets, interval_hours, running,
+                  last_started_at, last_completed_at, last_result, updated_at
+           FROM network_check_settings WHERE id=1"""
+    ).fetchone()
+    conn.close()
+    if row:
+        return dict(row)
+    return {
+        'enabled': 0, 'targets': '', 'interval_hours': 6.0,
+        'running': 0, 'last_started_at': None, 'last_completed_at': None,
+        'last_result': '', 'updated_at': None,
+    }
+
+
+def update_network_check_settings(enabled=_UNSET, targets=_UNSET,
+                                  interval_hours=_UNSET):
+    current = get_network_check_settings()
+    updates = []
+    params = []
+    desired_targets = current.get('targets', '')
+    desired_enabled = bool(current.get('enabled'))
+    if targets is not _UNSET:
+        ok, value = normalize_network_targets(targets)
+        if not ok:
+            return False, value
+        desired_targets = value
+        updates.append('targets=?')
+        params.append(value)
+    if interval_hours is not _UNSET:
+        try:
+            value = float(interval_hours)
+        except (TypeError, ValueError):
+            return False, '检测周期必须是数字'
+        if not math.isfinite(value) or not (1 / 60) <= value <= 168:
+            return False, '检测周期必须在 1 分钟到 168 小时之间'
+        updates.append('interval_hours=?')
+        params.append(value)
+    if enabled is not _UNSET:
+        desired_enabled = bool(enabled)
+        updates.append('enabled=?')
+        params.append(1 if desired_enabled else 0)
+    elif desired_enabled and not desired_targets:
+        desired_enabled = False
+        updates.append('enabled=0')
+    if desired_enabled and not desired_targets:
+        return False, '启用网络检测前必须至少设置一个检测 IP'
+    if not updates:
+        return True, '配置未变化'
+    updates.append("updated_at=datetime('now','localtime')")
+    conn = get_conn()
+    try:
+        with conn:
+            conn.execute(
+                f"UPDATE network_check_settings SET {', '.join(updates)} WHERE id=1",
+                params,
+            )
+        return True, 'LXC 网络检测配置已更新'
+    finally:
+        conn.close()
+
+
+def try_claim_network_check(force=False, now=None):
+    """原子认领一个检测周期，防止定时和手动检测重叠。"""
+    now = now or datetime.datetime.now()
+    conn = get_conn()
+    try:
+        with conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute(
+                'SELECT * FROM network_check_settings WHERE id=1'
+            ).fetchone()
+            settings = dict(row)
+            if not force and not settings['enabled']:
+                return False, '网络检测未启用'
+            ok, normalized = normalize_network_targets(settings['targets'])
+            if not ok or not normalized:
+                return False, '未配置有效检测 IP'
+
+            last_started = None
+            if settings.get('last_started_at'):
+                try:
+                    last_started = datetime.datetime.strptime(
+                        settings['last_started_at'], '%Y-%m-%d %H:%M:%S'
+                    )
+                except (TypeError, ValueError):
+                    last_started = None
+            if settings['running']:
+                # 服务异常退出后允许 24 小时以上的陈旧锁自动恢复。
+                if last_started and (now - last_started).total_seconds() < 24 * 3600:
+                    return False, '已有网络检测正在运行'
+            if not force and last_started:
+                interval = float(settings['interval_hours']) * 3600
+                if (now - last_started).total_seconds() < interval:
+                    return False, '尚未到达下次检测时间'
+
+            started = now.strftime('%Y-%m-%d %H:%M:%S')
+            conn.execute(
+                """UPDATE network_check_settings
+                   SET running=1, last_started_at=?, last_result='检测中'
+                   WHERE id=1""",
+                (started,),
+            )
+            settings['targets'] = normalized
+            settings['target_list'] = normalized.split(';')
+            settings['last_started_at'] = started
+            settings['running'] = 1
+            return True, settings
+    finally:
+        conn.close()
+
+
+def finish_network_check(result):
+    conn = get_conn()
+    with conn:
+        conn.execute(
+            """UPDATE network_check_settings
+               SET running=0, last_completed_at=datetime('now','localtime'),
+                   last_result=? WHERE id=1""",
+            (str(result)[:500],),
+        )
+    conn.close()
+
+
+def recover_interrupted_network_check():
+    """Bot 重启时释放上次未完成的检测，使其能在启动后重新运行。"""
+    conn = get_conn()
+    with conn:
+        cursor = conn.execute(
+            """UPDATE network_check_settings
+               SET running=0, last_started_at=NULL,
+                   last_result='上次检测被服务重启中断，等待重新检测'
+               WHERE id=1 AND running=1"""
+        )
+    conn.close()
+    return cursor.rowcount == 1
+
+
+def record_network_check(vm_id, vm_name, target, success, detail=''):
+    conn = get_conn()
+    with conn:
+        conn.execute(
+            """INSERT INTO network_check_logs
+               (vm_id, vm_name, target, success, detail)
+               VALUES (?, ?, ?, ?, ?)""",
+            (vm_id, vm_name or '', target, 1 if success else 0, str(detail)[:1000]),
+        )
+        conn.execute(
+            """DELETE FROM network_check_logs
+               WHERE id NOT IN (
+                   SELECT id FROM network_check_logs ORDER BY id DESC LIMIT 1000
+               )"""
+        )
+    conn.close()
+
+
+def get_network_check_logs(limit=20, failures_only=False):
+    conn = get_conn()
+    sql = 'SELECT * FROM network_check_logs'
+    if failures_only:
+        sql += ' WHERE success=0'
+    sql += ' ORDER BY id DESC LIMIT ?'
+    rows = conn.execute(sql, (max(1, int(limit)),)).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
 
 
 def get_usage_alerts(minimum_percent=80):
